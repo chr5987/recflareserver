@@ -1,0 +1,34 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "admin",
+	"main": "src/admin.app.ts",
+	"compatibility_date": "2026-06-16",
+	"compatibility_flags": ["nodejs_compat"],
+	"routes": [],
+	// React SPA client build (Vite emits it to dist/admin/client). Static assets are
+	// served directly; any non-asset request falls through to the Worker. Only `/api/*`
+	// is Worker-handled — everything else is asset-first with the SPA fallback to
+	// index.html, same pattern as `www` (see its wrangler.jsonc for why
+	// `run_worker_first` has to be an exhaustive allowlist, not just the new routes).
+	"assets": {
+		"binding": "ASSETS",
+		"not_found_handling": "single-page-application",
+		"run_worker_first": ["/api/*"]
+	},
+	"upload_source_maps": true,
+	"observability": {
+		"logs": {
+			"enabled": true,
+			"head_sampling_rate": 1 // 100%
+		}
+	},
+	"vars": {
+		"ENVIRONMENT": "development", // overridden during deployment
+		"SENTRY_RELEASE": "unknown", // overridden during deployment
+		// Base domain `auth`/`api` are derived from (auth.<DOMAIN>, api.<DOMAIN>).
+		// Overridden at deploy time with the real RECFLARE_DOMAIN (see
+		// run-wrangler-deploy). Served to the SPA via `/api/config`, so one client build
+		// works for any operator's domain — same pattern as `www`.
+		"DOMAIN": "rec.example.com"
+	}
+}

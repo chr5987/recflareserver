@@ -1265,6 +1265,110 @@ describe('auth worker routes', () => {
 	})
 })
 
+// The standalone `admin` worker's Players view calls these directly. Every route here is
+// gated on `requireDeveloper` — narrower than the game's own elevated-role checks, which
+// accept moderator OR developer — so these tests specifically pin that a moderator-only
+// token is refused, not just that an anonymous one is.
+describe('admin routes (developer-only)', () => {
+	/** Seed an account with LOGIN_PASSWORD set and the given role flags. */
+	async function seedAdminAccount(
+		accountId: number,
+		username: string,
+		roles: { isDeveloper?: boolean; isModerator?: boolean } = {}
+	): Promise<void> {
+		await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
+			.bind(
+				JSON.stringify({
+					accountId,
+					username,
+					passwordHash: await hashPassword(LOGIN_PASSWORD),
+					...roles,
+				})
+			)
+			.run()
+	}
+
+	async function tokenForAccount(username: string): Promise<string> {
+		return accessTokenFor(`grant_type=password&username=${username}&password=${LOGIN_PASSWORD}`)
+	}
+
+	function withAuth(token: string): Record<string, string> {
+		return { Authorization: `Bearer ${token}` }
+	}
+
+	test('GET /admin/accounts/search 401s with no token', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/admin/accounts/search?q=play`)
+		expect(res.status).toBe(401)
+	})
+
+	test('GET /admin/accounts/search 403s for a moderator-only token', async () => {
+		await seedAdminAccount(9001, 'ModOnly', { isModerator: true })
+		const token = await tokenForAccount('ModOnly')
+		const res = await exports.default.fetch(`${ORIGIN}/admin/accounts/search?q=play`, {
+			headers: withAuth(token),
+		})
+		expect(res.status).toBe(403)
+	})
+
+	test('GET /admin/accounts/search returns matches for a developer token', async () => {
+		await seedAdminAccount(9002, 'DevSearcher', { isDeveloper: true })
+		await seedAdminAccount(9003, 'PlayerAlpha')
+		await seedAdminAccount(9004, 'PlayerBeta')
+		const token = await tokenForAccount('DevSearcher')
+
+		const res = await exports.default.fetch(`${ORIGIN}/admin/accounts/search?q=Player`, {
+			headers: withAuth(token),
+		})
+		expect(res.status).toBe(200)
+		const results = (await res.json()) as Array<{ accountId: number; username: string }>
+		expect(results.map((r) => r.accountId).sort()).toEqual([9003, 9004])
+	})
+
+	test('GET /admin/accounts/:id 404s for an unknown account', async () => {
+		await seedAdminAccount(9005, 'DevLookup', { isDeveloper: true })
+		const token = await tokenForAccount('DevLookup')
+		const res = await exports.default.fetch(`${ORIGIN}/admin/accounts/999999`, {
+			headers: withAuth(token),
+		})
+		expect(res.status).toBe(404)
+	})
+
+	test('POST /admin/accounts/:id/roles grants and revokes a role round-trip', async () => {
+		await seedAdminAccount(9006, 'DevGranter', { isDeveloper: true })
+		await seedAdminAccount(9007, 'PromoteMe')
+		const token = await tokenForAccount('DevGranter')
+
+		const grant = await exports.default.fetch(`${ORIGIN}/admin/accounts/9007/roles`, {
+			method: 'POST',
+			headers: { ...withAuth(token), 'content-type': 'application/json' },
+			body: JSON.stringify({ role: 'moderator', grant: true }),
+		})
+		expect(grant.status).toBe(200)
+		expect(await grant.json()).toMatchObject({ accountId: 9007, isModerator: true })
+
+		const revoke = await exports.default.fetch(`${ORIGIN}/admin/accounts/9007/roles`, {
+			method: 'POST',
+			headers: { ...withAuth(token), 'content-type': 'application/json' },
+			body: JSON.stringify({ role: 'moderator', grant: false }),
+		})
+		expect(revoke.status).toBe(200)
+		expect(await revoke.json()).toMatchObject({ accountId: 9007, isModerator: false })
+	})
+
+	test('POST /admin/accounts/:id/roles 404s rather than creating a phantom account', async () => {
+		await seedAdminAccount(9008, 'DevNoPhantom', { isDeveloper: true })
+		const token = await tokenForAccount('DevNoPhantom')
+		const res = await exports.default.fetch(`${ORIGIN}/admin/accounts/888888/roles`, {
+			method: 'POST',
+			headers: { ...withAuth(token), 'content-type': 'application/json' },
+			body: JSON.stringify({ role: 'developer', grant: true }),
+		})
+		expect(res.status).toBe(404)
+		const row = await env.DB.prepare('SELECT 1 FROM account WHERE account_id = 888888').first()
+		expect(row).toBeNull()
+	})
+})
+
 // The website is a browser origin calling these endpoints directly — the same ones the
 // game calls — instead of proxying them through `www`. That only works if the responses
 // carry CORS headers: without them the browser discards a perfectly good token response

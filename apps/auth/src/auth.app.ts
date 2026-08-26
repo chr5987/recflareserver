@@ -14,6 +14,7 @@ import {
 	getRoomById,
 	hashPassword,
 	RoomInstanceType,
+	searchAccounts,
 	setLastLoginTime,
 	setLoginContext,
 	setPasswordHash,
@@ -30,7 +31,12 @@ import {
 	withNotFound,
 	withOnError,
 } from '@repo/hono-helpers'
-import { generateToken, TOKEN_TTL_SECONDS, validateAndGetAccountId } from '@repo/jwt'
+import {
+	generateToken,
+	TOKEN_TTL_SECONDS,
+	validateAndGetAccountId,
+	validateAndGetRoles,
+} from '@repo/jwt'
 
 // The account-wide ban lives on a `report` row, whose table the api worker owns; its db
 // module is plain D1 queries with no runtime deps, so it imports cleanly here.
@@ -61,7 +67,7 @@ import {
 import { consumeRefreshToken, issueRefreshToken } from './refresh-db'
 import { verifySteamTicket } from './steam-ticket'
 
-import type { Context } from 'hono'
+import type { Context, MiddlewareHandler } from 'hono'
 import type { Account } from '@repo/domain'
 import type { App } from './context'
 import type { PlatformLink } from './platform-db'
@@ -221,6 +227,42 @@ function accountRoles(
 	if (account.isJunior) roles.push('junior')
 	return roles
 }
+
+/**
+ * Gates the `/admin/*` routes on a valid token carrying the `developer` role -
+ * narrower than `notify`'s `ADMIN_ROLES` (developer OR moderator): the standalone admin
+ * worker is developer-only by design, so a moderator token is a valid login but gets a
+ * 403 here just like an unprivileged one. 401 for a missing/invalid token.
+ */
+const requireDeveloper: MiddlewareHandler<App> = async (c, next) => {
+	const roles = await validateAndGetRoles(c.req.raw, await c.env.JWT_SECRET.get())
+	if (roles === null) return c.json({ error: 'Unauthorized' }, 401)
+	if (!roles.includes('developer')) return c.json({ error: 'Forbidden' }, 403)
+	await next()
+}
+
+/**
+ * The account fields the admin UI needs — id, names, creation time and the two
+ * operator-granted role flags — never the full blob (which also carries the password
+ * hash, IPs and device id).
+ */
+interface AdminAccountView {
+	accountId: number
+	username: string
+	displayName: string
+	createdAt: string
+	isDeveloper: boolean
+	isModerator: boolean
+}
+
+const toAdminView = (account: Account): AdminAccountView => ({
+	accountId: account.accountId,
+	username: account.username,
+	displayName: account.displayName,
+	createdAt: account.createdAt,
+	isDeveloper: account.isDeveloper === true,
+	isModerator: account.isModerator === true,
+})
 
 /**
  * The account's token `rn.privilege` claim. Despite the scope-shaped name it is a CLAIM,
@@ -1177,6 +1219,61 @@ const app = new Hono<App>()
 		const account = Number.isNaN(accountId) ? null : await getAccount(c.env.DB, accountId)
 		if (!account) return c.body(null, 404)
 		return c.json(account.isModerator === true)
+	})
+
+	// ---- Admin (developer-only) ---------------------------------------------
+	// Backs the standalone `admin` worker's Players view: search/lookup accounts and
+	// grant/revoke the developer/moderator role flags. Every route here is gated on
+	// `requireDeveloper` — a moderator token authenticates but is refused (403), since
+	// this surface is developer-only by design (see the admin worker's login gate,
+	// which mirrors this check client-side for the UI, but the enforcement is here).
+
+	.use('/admin/*', requireDeveloper)
+
+	// Prefix search by username, hyphenated the same way `runx admin lookup` and the
+	// game's own username matching do (case-insensitive, "begins with"). Empty/missing
+	// `q` answers an empty array rather than every account, matching `searchAccounts`.
+	.get('/admin/accounts/search', async (c) => {
+		const q = c.req.query('q') ?? ''
+		const accounts = await searchAccounts(c.env.DB, q)
+		return c.json(accounts.map(toAdminView))
+	})
+
+	// Single account lookup by id, for the ban/role panel once a search result is
+	// selected. 404 for an unknown or non-numeric id.
+	.get('/admin/accounts/:id', async (c) => {
+		const accountId = Number.parseInt(c.req.param('id'), 10)
+		const account = Number.isNaN(accountId) ? null : await getAccount(c.env.DB, accountId)
+		if (!account) return c.json({ error: 'No such account' }, 404)
+		return c.json(toAdminView(account))
+	})
+
+	// Grant or revoke the developer/moderator role flag on an account — the HTTP
+	// equivalent of `runx admin grant-developer` / `grant-moderator`, so an operator no
+	// longer needs shell access to the D1 database to hand out (or take back) a role.
+	// Body: `{ role: 'developer' | 'moderator', grant: boolean }`.
+	.post('/admin/accounts/:id/roles', async (c) => {
+		const accountId = Number.parseInt(c.req.param('id'), 10)
+		if (Number.isNaN(accountId)) return c.json({ error: 'Invalid account id' }, 400)
+
+		const body = await c.req
+			.json<{ role?: string; grant?: boolean }>()
+			.catch(() => ({}) as { role?: string; grant?: boolean })
+		if (body.role !== 'developer' && body.role !== 'moderator') {
+			return c.json({ error: "role must be 'developer' or 'moderator'" }, 400)
+		}
+		if (typeof body.grant !== 'boolean') {
+			return c.json({ error: 'grant must be a boolean' }, 400)
+		}
+
+		const existing = await getAccount(c.env.DB, accountId)
+		if (!existing) return c.json({ error: 'No such account' }, 404)
+
+		const overrides: Partial<Account> =
+			body.role === 'developer' ? { isDeveloper: body.grant } : { isModerator: body.grant }
+		logger.info('admin role change', { accountId, role: body.role, grant: body.grant })
+		const updated = await updateAccount(c.env.DB, accountId, overrides)
+		return c.json(toAdminView(updated))
 	})
 
 	// @guess Oculus nonce. The client asks for this before a Meta login; the exact shape

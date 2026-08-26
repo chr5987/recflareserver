@@ -16,9 +16,10 @@
  * A request with no path (just `/`) that selects no service serves the `ns` discovery
  * document, so a bare hit to the facade root returns the service map to bootstrap from.
  *
- * NOT mounted here: `www`, `img`, `econ`. Each binds a static `assets` directory and
- * Cloudflare allows only one static-assets binding per Worker. Resolve that (serve
- * their static trees from R2, or keep those three as their own Workers) before adding.
+ * NOT mounted here: `www`, `img`, `econ`, `admin`. Each binds a static `assets`
+ * directory and Cloudflare allows only one static-assets binding per Worker. Resolve
+ * that (serve their static trees from R2, or keep those as their own Workers) before
+ * adding.
  */
 import accounts from '../../accounts/src/accounts.app'
 import api from '../../api/src/api.app'
