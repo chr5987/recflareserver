@@ -19,7 +19,7 @@ import {
 import { banFromReport, createReport, getActiveBan, getReportsAgainst } from '../reports-db'
 import { createWarning, getWarningsAgainst } from '../warnings-db'
 
-import type { Context } from 'hono'
+import type { Context, MiddlewareHandler } from 'hono'
 import type { App } from '../context'
 
 /**
@@ -43,6 +43,27 @@ const adminPlayerId = (c: Context<App>): number | null => {
 	if (raw === undefined) return null
 	const playerId = Number.parseInt(raw, 10)
 	return Number.isInteger(playerId) && playerId >= 0 ? playerId : null
+}
+
+/**
+ * Gates the `/admin/*` ban routes on a valid token carrying the `developer` role.
+ * Narrower than {@link MODERATOR_ROLES} (which also allows a plain moderator to issue a
+ * warning): banning/unbanning through this surface is developer-only, matching the
+ * standalone admin worker's login gate. 401 for a missing/invalid token, 403 for a valid
+ * token without the role.
+ */
+const requireDeveloper: MiddlewareHandler<App> = async (c, next) => {
+	const roles = await authedRoles(c)
+	if (roles === null) return unauthorized(c)
+	if (!roles.includes('developer')) return c.json({ error: 'Forbidden' }, 403)
+	await next()
+}
+
+/** Parse a query/body value as a positive integer, or null when absent / not one. */
+const asPositiveInt = (v: string | undefined): number | null => {
+	if (v === undefined) return null
+	const n = Number.parseInt(v, 10)
+	return Number.isNaN(n) || n <= 0 ? null : n
 }
 
 /**
@@ -415,3 +436,66 @@ export const moderationRoutes = new Hono<App>({ strict: false })
 		}),
 		(c) => c.json([])
 	)
+
+	// ---- Admin (developer-only) ban routes -----------------------------------
+	// Backs the standalone `admin` worker's ban panel. Distinct from the warning routes
+	// above: those accept `moderator` OR `developer`, these accept `developer` only.
+
+	.use('/admin/bans/*', requireDeveloper)
+
+	// Active ban (if any) plus recent report history, for the ban panel once a player is
+	// selected in the admin UI's search results.
+	.get('/admin/bans/:playerId', async (c) => {
+		const playerId = asPositiveInt(c.req.param('playerId'))
+		if (playerId === null) return c.json({ error: 'Invalid player id' }, 400)
+		const [activeBan, reports] = await Promise.all([
+			getActiveBan(c.env.DB, playerId),
+			getReportsAgainst(c.env.DB, playerId),
+		])
+		return c.json({ activeBan, reports })
+	})
+
+	// Ban a player. Body: `{ reason?: string, durationDays?: number, permanent?: boolean }`.
+	// With neither `durationDays` nor `permanent` set, defaults to permanent — an admin
+	// issuing a ban with no duration almost certainly means "until someone lifts it",
+	// not "expires immediately". Creates a fresh report row attributed to the acting
+	// developer (rather than reusing an existing player-submitted report) so the ban
+	// carries its own record of who issued it and why.
+	.post('/admin/bans/:playerId', async (c) => {
+		const playerId = asPositiveInt(c.req.param('playerId'))
+		if (playerId === null) return c.json({ error: 'Invalid player id' }, 400)
+
+		const actingId = await authedId(c)
+		if (actingId === null) return unauthorized(c)
+
+		const body = await c.req
+			.json<{ reason?: string; durationDays?: number; permanent?: boolean }>()
+			.catch(() => ({}) as { reason?: string; durationDays?: number; permanent?: boolean })
+
+		const banExpires =
+			body.permanent === true || body.durationDays === undefined
+				? null
+				: new Date(Date.now() + body.durationDays * 24 * 60 * 60 * 1000).toISOString()
+
+		const report = await createReport(c.env.DB, {
+			reporterPlayerId: actingId,
+			reportedPlayerId: playerId,
+			details: body.reason ?? null,
+		})
+		const banned = await banFromReport(c.env.DB, report.id, { banned: true, banExpires })
+		return c.json({ activeBan: banned })
+	})
+
+	// Lift the player's currently active ban, if any. No-op (200, `liftedBan: null`) when
+	// they aren't currently banned, rather than a 404 — "already not banned" isn't an
+	// error for this button.
+	.post('/admin/bans/:playerId/lift', async (c) => {
+		const playerId = asPositiveInt(c.req.param('playerId'))
+		if (playerId === null) return c.json({ error: 'Invalid player id' }, 400)
+
+		const active = await getActiveBan(c.env.DB, playerId)
+		if (!active) return c.json({ liftedBan: null })
+
+		const lifted = await banFromReport(c.env.DB, active.id, { banned: false })
+		return c.json({ liftedBan: lifted })
+	})

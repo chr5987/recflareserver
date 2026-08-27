@@ -288,6 +288,22 @@ internet at three. Two consequences: **deploy `auth` before `www`** on a fresh a
 carry that shared address as their permanent `signupIp` — harmless, but they are not
 counted against any real network.
 
+### The admin dashboard
+
+`apps/admin` is a standalone worker for player management — search accounts,
+grant/revoke the `developer`/`moderator` roles, and ban/unban a player. It
+deploys like any other worker (`just deploy -F admin`, or it's included in a
+full `just deploy`) onto its own hostname, `admin.<DOMAIN>` by default (see
+`RECFLARE_SUBDOMAINS` above to change it).
+
+No extra setup is required: it needs no storage bindings of its own and
+reuses the shared `JWT_SECRET` already configured for `auth`/`api`. Access is
+gated on the **`developer`** role specifically (grant it to an account with
+`runx admin grant-developer`, or via this same dashboard once one account
+has it) — a `moderator`-only account can sign in but is refused the
+dashboard. This is not part of the game's own service-discovery document
+(`SERVICES.md`/`ns`); it's a separate operator tool.
+
 ## Repository Structure
 
 - `apps/` - The service workers, one deployable Worker per subdirectory. Each has

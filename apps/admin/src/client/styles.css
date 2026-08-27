@@ -1,0 +1,181 @@
+:root {
+	color-scheme: dark;
+	--bg: #14100c;
+	--panel: #201a14;
+	--border: #3a2f24;
+	--text: #f2ece2;
+	--muted: #a89c8c;
+	--accent: #fe7101;
+	--danger: #d94343;
+	--ok: #4caf6a;
+	font-family:
+		'IBM Plex Sans', system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+}
+
+* {
+	box-sizing: border-box;
+}
+
+body {
+	margin: 0;
+	background: var(--bg);
+	color: var(--text);
+}
+
+#root {
+	min-height: 100vh;
+	display: flex;
+	flex-direction: column;
+}
+
+button {
+	font-family: inherit;
+	cursor: pointer;
+}
+
+input {
+	font-family: inherit;
+}
+
+.shell {
+	max-width: 960px;
+	width: 100%;
+	margin: 0 auto;
+	padding: 2rem 1.25rem 4rem;
+}
+
+.brand {
+	display: flex;
+	align-items: baseline;
+	gap: 0.5rem;
+	margin-bottom: 1.5rem;
+}
+
+.brand h1 {
+	font-family: 'Archivo', sans-serif;
+	font-size: 1.4rem;
+	margin: 0;
+}
+
+.brand span {
+	color: var(--accent);
+}
+
+.card {
+	background: var(--panel);
+	border: 1px solid var(--border);
+	border-radius: 10px;
+	padding: 1.25rem;
+	margin-bottom: 1rem;
+}
+
+.field {
+	display: flex;
+	flex-direction: column;
+	gap: 0.35rem;
+	margin-bottom: 0.85rem;
+}
+
+.field label {
+	font-size: 0.85rem;
+	color: var(--muted);
+}
+
+.field input {
+	background: var(--bg);
+	border: 1px solid var(--border);
+	color: var(--text);
+	border-radius: 6px;
+	padding: 0.5rem 0.65rem;
+}
+
+.btn {
+	background: var(--accent);
+	border: none;
+	color: #14100c;
+	font-weight: 600;
+	border-radius: 6px;
+	padding: 0.5rem 0.9rem;
+}
+
+.btn:disabled {
+	opacity: 0.6;
+	cursor: default;
+}
+
+.btn.secondary {
+	background: transparent;
+	border: 1px solid var(--border);
+	color: var(--text);
+}
+
+.btn.danger {
+	background: var(--danger);
+	color: #fff;
+}
+
+.error {
+	color: var(--danger);
+	font-size: 0.9rem;
+}
+
+.ok {
+	color: var(--ok);
+	font-size: 0.9rem;
+}
+
+.muted {
+	color: var(--muted);
+	font-size: 0.85rem;
+}
+
+.player-row {
+	border: 1px solid var(--border);
+	border-radius: 8px;
+	padding: 0.85rem;
+	margin-bottom: 0.6rem;
+}
+
+.player-row header {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 0.5rem;
+	flex-wrap: wrap;
+}
+
+.tag {
+	display: inline-block;
+	border-radius: 999px;
+	padding: 0.1rem 0.55rem;
+	font-size: 0.75rem;
+	font-weight: 600;
+	margin-left: 0.4rem;
+}
+
+.tag.developer {
+	background: #3d2f14;
+	color: #ffb95c;
+}
+
+.tag.moderator {
+	background: #14273d;
+	color: #6ca9ff;
+}
+
+.tag.banned {
+	background: #3d1414;
+	color: #ff6c6c;
+}
+
+.row-actions {
+	display: flex;
+	gap: 0.4rem;
+	flex-wrap: wrap;
+}
+
+.ban-panel {
+	margin-top: 0.75rem;
+	padding-top: 0.75rem;
+	border-top: 1px solid var(--border);
+}
