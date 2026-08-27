@@ -342,6 +342,38 @@ describe('notification delivery', () => {
 		expect(res.status).toBe(400)
 	})
 
+	test('coach-message targets only the selected online player', async () => {
+		const playerId = 9010
+		const target = await connect('coach-one-target')
+		const other = await connect('coach-one-other')
+		send(target.ws, {
+			type: 1,
+			invocationId: 'target-subscribe',
+			target: 'SubscribeToPlayers',
+			arguments: [{ playerIds: [playerId] }],
+		})
+		await target.waitFor((r) => r.type === 3 && r.invocationId === 'target-subscribe')
+
+		const res = await post('/internal/coach-message', { playerId, messageContent: 'hello one' })
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual({ success: true, sent: 1 })
+		const note = await target.waitFor((r) => r.type === 1 && r.target === 'Notification')
+		expect(JSON.parse((note.arguments as string[])[0])).toMatchObject({
+			Id: '2',
+			Msg: { FromPlayerId: 1, Type: 100, Data: 'hello one' },
+		})
+
+		target.ws.close()
+		other.ws.close()
+	})
+
+	test('coach-message validates its target and content', async () => {
+		const noPlayer = await post('/internal/coach-message', { messageContent: 'hello' })
+		expect(noPlayer.status).toBe(400)
+		const empty = await post('/internal/coach-message', { playerId: 1, messageContent: '  ' })
+		expect(empty.status).toBe(400)
+	})
+
 	test('emits a numeric notificationType as a string Id', async () => {
 		// The client dispatches on a string Id, so numeric codes (e.g. econ's
 		// NotificationType enum) must be serialized as strings or they're dropped.

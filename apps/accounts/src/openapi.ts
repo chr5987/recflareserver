@@ -37,6 +37,18 @@ export function json(schema: z.ZodType, description: string) {
 	return { description, content: { 'application/json': { schema: resolver(schema) } } }
 }
 
+/** Emit a zod schema as an `application/json` request body. */
+export function jsonBody(schema: z.ZodType, description: string): OpenAPIV3_1.RequestBodyObject {
+	const { $schema: _$schema, ...jsonSchema } = z.toJSONSchema(schema)
+	return {
+		description,
+		required: true,
+		content: {
+			'application/json': { schema: jsonSchema as OpenAPIV3_1.SchemaObject },
+		},
+	}
+}
+
 /**
  * Emit a zod schema as a form request body. `describeRoute`'s `requestBody` takes a
  * plain OpenAPI schema (not a `resolver()`), so convert here. zod's `$schema` key and
@@ -136,6 +148,51 @@ export const PrivacySettings = z.object({ accountId: z.int(), isRecentHistoryVis
 
 /** Root health check. */
 export const HealthResponse = z.object({ service: z.literal('accounts'), status: z.literal('ok') })
+
+// ---- Staff administration ---------------------------------------------------
+
+/** The only account roles that can be granted through the staff directory. */
+export const AdminRole = z.enum(['developer', 'moderator'])
+
+/** A compact player record returned by the paginated staff directory. */
+export const AdminPlayerSummary = z.object({
+	accountId: z.int().nonnegative(),
+	username: z.string(),
+	displayName: z.string(),
+	createdAt: z.iso.datetime().nullable().describe('Null for legacy rows without a creation timestamp'),
+	roles: AdminRole.array(),
+	isOnline: z.boolean(),
+	isBanned: z.boolean().describe('Current direct account-ban state'),
+})
+
+/** `GET /admin/players` response. `nextCursor` is passed as `cursor` to continue. */
+export const AdminPlayerDirectory = z.object({
+	players: AdminPlayerSummary.array(),
+	nextCursor: z.int().nonnegative().nullable(),
+})
+
+/**
+ * Staff-only operational account view. This deliberately enumerates safe fields instead of
+ * extending Account: credential material (notably passwordHash) must never reach this surface.
+ */
+export const AdminPlayerDetail = AdminPlayerSummary.extend({
+	email: z.string().nullable(),
+	phone: z.string().nullable(),
+	deviceId: z.string().nullable(),
+	deviceClass: z.int().nullable(),
+	platformId: z.string().nullable(),
+	platform: z.int().nullable(),
+	lastLoginTime: z.iso.datetime().nullable(),
+})
+
+/** `POST /admin/players/:id/roles` JSON body. */
+export const AdminRoleMutationRequest = z.object({
+	role: AdminRole,
+	grant: z.boolean(),
+})
+
+/** The small error envelope used exclusively by staff administration routes. */
+export const AdminErrorResponse = z.object({ error: z.string() })
 
 // ---- Request bodies --------------------------------------------------------
 

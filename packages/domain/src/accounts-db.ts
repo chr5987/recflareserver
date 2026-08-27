@@ -226,6 +226,83 @@ export async function searchAccounts(
 	return parseAll(results)
 }
 
+/** Default and maximum page sizes for the staff account directory. */
+export const ADMIN_ACCOUNT_DIRECTORY_DEFAULT_LIMIT = 50
+export const ADMIN_ACCOUNT_DIRECTORY_MAX_LIMIT = 100
+
+/** A keyset page from the staff account directory. */
+export interface AccountDirectoryPage {
+	accounts: Account[]
+	/** The final account id in this page, or null when the result is exhausted. */
+	nextCursor: number | null
+}
+
+/**
+ * List persisted accounts for the staff directory. The cursor is the last seen account id,
+ * making pages stable as new (higher-id) accounts are created. A nonempty query prefix-matches
+ * usernames and, when numeric, also exactly matches an account id.
+ */
+export async function listAccountsForAdmin(
+	db: D1Database,
+	{ query = '', cursor = 0, limit = ADMIN_ACCOUNT_DIRECTORY_DEFAULT_LIMIT }: {
+		query?: string
+		cursor?: number
+		limit?: number
+	} = {}
+): Promise<AccountDirectoryPage> {
+	const normalizedQuery = query.trim().toLowerCase()
+	const numericQuery =
+		/^\d+$/.test(normalizedQuery) && Number.isSafeInteger(Number(normalizedQuery))
+			? Number(normalizedQuery)
+			: -1
+	const pageSize = Math.min(Math.max(limit, 1), ADMIN_ACCOUNT_DIRECTORY_MAX_LIMIT)
+	const { results } = await db
+		.prepare(
+			`SELECT data FROM account
+			 WHERE account_id > ?1
+			   AND (
+			     ?2 = ''
+			     OR username_lower LIKE ?3 ESCAPE '\\'
+			     OR account_id = ?4
+			   )
+			 ORDER BY account_id
+			 LIMIT ?5`
+		)
+		.bind(cursor, normalizedQuery, `${escapeLike(normalizedQuery)}%`, numericQuery, pageSize + 1)
+		.all<AccountRow>()
+	const accounts = parseAll(results)
+	const hasMore = accounts.length > pageSize
+	if (hasMore) accounts.pop()
+	return {
+		accounts,
+		nextCursor: hasMore ? accounts.at(-1)!.accountId : null,
+	}
+}
+
+/**
+ * Return the persisted accounts in `accountIds` that have a currently effective direct ban.
+ * `report` is a shared-D1 table owned by the API worker, so this intentionally asks only for
+ * the basic direct-ban state and does not attempt its platform/IP evasion resolution.
+ */
+export async function getDirectlyBannedAccountIds(
+	db: D1Database,
+	accountIds: number[],
+	now = new Date().toISOString()
+): Promise<Set<number>> {
+	if (accountIds.length === 0) return new Set()
+	const placeholders = accountIds.map((_, i) => `?${i + 1}`).join(', ')
+	const { results } = await db
+		.prepare(
+			`SELECT DISTINCT reported_player_id AS accountId FROM report
+			 WHERE reported_player_id IN (${placeholders})
+			   AND banned = 1
+			   AND (ban_expires IS NULL OR ban_expires > ?${accountIds.length + 1})`
+		)
+		.bind(...accountIds, now)
+		.all<{ accountId: number }>()
+	return new Set(results.map((row) => row.accountId))
+}
+
 /**
  * Accounts last seen on a given device (the client-supplied `device_id` auth records
  * at login). An empty id yields no matches (avoids matching every account with no

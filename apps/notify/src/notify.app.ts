@@ -176,6 +176,21 @@ const app = new Hono<App>()
 		return c.json({ success: true, ...result })
 	})
 
+	// Staff-facing, online-only counterpart to the all-player Coach broadcast.
+	.post('/internal/coach-message', async (c) => {
+		const body = await c.req.json<{ playerId?: unknown; messageContent?: string }>().catch(() => null)
+		const playerId = typeof body?.playerId === 'number' ? body.playerId : NaN
+		const content = typeof body?.messageContent === 'string' ? body.messageContent.trim() : ''
+		if (!Number.isInteger(playerId) || playerId < 0) {
+			return c.json({ error: 'playerId must be a non-negative integer' }, 400)
+		}
+		if (content === '') return c.json({ error: 'messageContent is required' }, 400)
+		const result = await c.env.RECFLARE_NOTIFICATIONS_HUB
+			.getByName(HUB_INSTANCE)
+			.coachMessage(playerId, content)
+		return c.json({ success: true, ...result })
+	})
+
 	// Read-only view of the hub's routing state, for working out why a notification
 	// didn't arrive: which connections are live, which players each one receives for,
 	// and what's queued for a player who wasn't reachable.

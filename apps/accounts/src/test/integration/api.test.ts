@@ -4,7 +4,7 @@ import { beforeAll, describe, expect, test } from 'vitest'
 
 import '../../accounts.app'
 
-import { SCHEMA_DDL } from '@repo/domain'
+import { PRESENCE_SCHEMA_DDL, SCHEMA_DDL, setPresence, updateAccount } from '@repo/domain'
 
 import type { Env } from '../../context'
 
@@ -20,6 +20,16 @@ beforeAll(async () => {
 	// Seed the shared JWT signing key into the local Secrets Store so .get() resolves.
 	await adminSecretsStore(env.JWT_SECRET).create('test-signing-key')
 	for (const stmt of SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	for (const stmt of PRESENCE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	await env.DB
+		.prepare(
+			`CREATE TABLE IF NOT EXISTS report (
+				reported_player_id INTEGER NOT NULL,
+				banned INTEGER NOT NULL DEFAULT 0,
+				ban_expires TEXT
+			)`
+		)
+		.run()
 	const insert = env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
 	await env.DB.batch([
 		insert.bind(JSON.stringify({ accountId: 0, username: 'RecRoom', displayName: 'Rec Room' })),
@@ -39,10 +49,10 @@ function b64url(input: ArrayBuffer | string): string {
 	return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
 }
 
-async function bearer(sub = '42'): Promise<Record<string, string>> {
+async function bearer(sub = '42', roles: string[] = []): Promise<Record<string, string>> {
 	const now = Math.floor(Date.now() / 1000)
 	const signingInput = `${b64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }))}.${b64url(
-		JSON.stringify({ sub, exp: now + 3600 })
+		JSON.stringify({ sub, exp: now + 3600, role: roles })
 	)}`
 	const key = await crypto.subtle.importKey(
 		'raw',
@@ -133,6 +143,154 @@ describe('public endpoints', () => {
 		const lookup = await exports.default.fetch(`${ORIGIN}/account/${body.value.accountId}`)
 		const found = (await lookup.json()) as { username: string }
 		expect(found.username).toBe(body.value.username)
+	})
+})
+
+describe('staff player administration', () => {
+	const STAFF_ID = 9100
+	const ALPHA_ID = 9101
+	const BETA_ID = 9102
+	const ROLE_TARGET_ID = 9103
+
+	beforeAll(async () => {
+		await Promise.all([
+			updateAccount(env.DB, STAFF_ID, {
+				username: 'DirectoryStaff',
+				displayName: 'Directory Staff',
+				isDeveloper: true,
+			}),
+			updateAccount(env.DB, ALPHA_ID, {
+				username: 'DirectoryPlayerAlpha',
+				displayName: 'Directory Alpha',
+				email: 'alpha@example.com',
+				phone: '+15550000001',
+				deviceId: 'device-alpha',
+				deviceClass: 2,
+				platformId: '76561198000000001',
+				platform: 0,
+				lastLoginTime: '2026-08-26T12:00:00.000Z',
+				passwordHash: 'must-not-leak',
+			}),
+			updateAccount(env.DB, BETA_ID, {
+				username: 'DirectoryPlayerBeta',
+				displayName: 'Directory Beta',
+			}),
+			updateAccount(env.DB, ROLE_TARGET_ID, {
+				username: 'DirectoryRoleTarget',
+				displayName: 'Directory Role Target',
+			}),
+		])
+		await setPresence(env.DB, {
+			accountId: BETA_ID,
+			roomInstance: null,
+			statusVisibility: 0,
+			deviceClass: 2,
+			vrMovementMode: 0,
+			platform: 0,
+			appVersion: 'test',
+		})
+		await env.DB
+			.prepare(
+				'INSERT INTO report (reported_player_id, banned, ban_expires) VALUES (?1, 1, NULL)'
+			)
+			.bind(ALPHA_ID)
+			.run()
+	})
+
+	test('GET /admin/players returns 401 anonymous and 403 for non-staff tokens', async () => {
+		const anonymous = await exports.default.fetch(`${ORIGIN}/admin/players`)
+		expect(anonymous.status).toBe(401)
+		expect(await anonymous.json()).toEqual({ error: 'Unauthorized' })
+
+		const player = await exports.default.fetch(`${ORIGIN}/admin/players`, {
+			headers: await bearer('9109'),
+		})
+		expect(player.status).toBe(403)
+		expect(await player.json()).toEqual({ error: 'Forbidden' })
+	})
+
+	test('GET /admin/players paginates, searches IDs, and projects live status', async () => {
+		const headers = await bearer(String(STAFF_ID), ['developer'])
+		const first = await exports.default.fetch(
+			`${ORIGIN}/admin/players?q=DirectoryPlayer&limit=1`,
+			{ headers }
+		)
+		expect(first.status).toBe(200)
+		const firstPage = (await first.json()) as {
+			players: Array<{ accountId: number; isOnline: boolean; isBanned: boolean }>
+			nextCursor: number | null
+		}
+		expect(firstPage.players).toEqual([
+			expect.objectContaining({ accountId: ALPHA_ID, isOnline: false, isBanned: true }),
+		])
+		expect(firstPage.nextCursor).toBe(ALPHA_ID)
+
+		const second = await exports.default.fetch(
+			`${ORIGIN}/admin/players?q=DirectoryPlayer&limit=1&cursor=${firstPage.nextCursor}`,
+			{ headers }
+		)
+		const secondPage = (await second.json()) as {
+			players: Array<{ accountId: number; isOnline: boolean; isBanned: boolean }>
+			nextCursor: number | null
+		}
+		expect(secondPage.players).toEqual([
+			expect.objectContaining({ accountId: BETA_ID, isOnline: true, isBanned: false }),
+		])
+		expect(secondPage.nextCursor).toBeNull()
+
+		const numeric = await exports.default.fetch(`${ORIGIN}/admin/players?q=${BETA_ID}`, {
+			headers,
+		})
+		const numericPage = (await numeric.json()) as { players: Array<{ accountId: number }> }
+		expect(numericPage.players.map((player) => player.accountId)).toEqual([BETA_ID])
+	})
+
+	test('GET /admin/players/:id exposes operational fields but never password hashes', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/admin/players/${ALPHA_ID}`, {
+			headers: await bearer(String(STAFF_ID), ['developer']),
+		})
+		expect(res.status).toBe(200)
+		const detail = (await res.json()) as Record<string, unknown>
+		expect(detail).toMatchObject({
+			accountId: ALPHA_ID,
+			email: 'alpha@example.com',
+			phone: '+15550000001',
+			deviceId: 'device-alpha',
+			deviceClass: 2,
+			platformId: '76561198000000001',
+			platform: 0,
+			lastLoginTime: '2026-08-26T12:00:00.000Z',
+			isBanned: true,
+		})
+		expect(detail).not.toHaveProperty('passwordHash')
+	})
+
+	test('POST /admin/players/:id/roles permits staff role mutations', async () => {
+		const headers = {
+			...(await bearer('9110', ['moderator'])),
+			'Content-Type': 'application/json',
+		}
+		const grant = await exports.default.fetch(`${ORIGIN}/admin/players/${ROLE_TARGET_ID}/roles`, {
+			method: 'POST',
+			headers,
+			body: JSON.stringify({ role: 'moderator', grant: true }),
+		})
+		expect(grant.status).toBe(200)
+		expect(await grant.json()).toMatchObject({
+			accountId: ROLE_TARGET_ID,
+			roles: ['moderator'],
+		})
+
+		const revoke = await exports.default.fetch(`${ORIGIN}/admin/players/${ROLE_TARGET_ID}/roles`, {
+			method: 'POST',
+			headers,
+			body: JSON.stringify({ role: 'moderator', grant: false }),
+		})
+		expect(revoke.status).toBe(200)
+		expect(await revoke.json()).toMatchObject({
+			accountId: ROLE_TARGET_ID,
+			roles: [],
+		})
 	})
 })
 
@@ -488,10 +646,13 @@ describe('auth-gated endpoints', () => {
 			'GET /account/{id}',
 			'GET /account/{id}/bio',
 			'GET /accountprivacysettings/{id}',
+			'GET /admin/players',
+			'GET /admin/players/{id}',
 			'GET /parentalcontrol/me',
 			'POST /account/create',
 			'POST /account/me/email',
 			'POST /account/me/phone',
+			'POST /admin/players/{id}/roles',
 			'PUT /account/me/bannerimage',
 			'PUT /account/me/bio',
 			'PUT /account/me/displayname',

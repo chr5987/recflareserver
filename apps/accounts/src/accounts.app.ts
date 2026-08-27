@@ -8,6 +8,10 @@ import {
 	getAccount,
 	getAccountByUsername,
 	getAccountsByIds,
+	getDirectlyBannedAccountIds,
+	getPresence,
+	getPresences,
+	listAccountsForAdmin,
 	searchAccounts,
 	updateAccount,
 } from '@repo/domain'
@@ -18,13 +22,18 @@ import {
 	withNotFound,
 	withOnError,
 } from '@repo/hono-helpers'
-import { validateAndGetAccountId } from '@repo/jwt'
+import { validateAndGetAccountId, validateAndGetRoles } from '@repo/jwt'
 
 // The notification-type ids the hub carries (owned by the `notify` worker). Imported as a
 // value — the enum has no runtime dependencies.
 import { NotificationType } from '../../notify/src/notification-types'
 import {
 	AccountDto,
+	AdminErrorResponse,
+	AdminPlayerDetail,
+	AdminPlayerDirectory,
+	AdminPlayerSummary,
+	AdminRoleMutationRequest,
 	BannerImageRequest,
 	BioRequest,
 	BioResponse,
@@ -36,6 +45,7 @@ import {
 	HealthResponse,
 	IdentityFlagsRequest,
 	json,
+	jsonBody,
 	ParentalControl,
 	PhoneRequest,
 	PrivacySettings,
@@ -177,6 +187,56 @@ const UNAUTHORIZED_RESPONSE = { description: 'Missing or invalid bearer token (e
 /** Bearer-JWT security requirement, for the auth-gated routes. */
 const AUTHED = [{ bearerAuth: [] }]
 
+/** Elevated roles permitted to use the operational player directory, matching notify. */
+const ADMIN_ROLES: ReadonlySet<string> = new Set(['developer', 'moderator'])
+
+/** Authenticate a staff request. Unlike game routes, staff errors carry an operator-readable body. */
+async function requireAdmin(c: Context<App>): Promise<Response | null> {
+	const roles = await validateAndGetRoles(c.req.raw, await c.env.JWT_SECRET.get())
+	if (roles === null) return c.json({ error: 'Unauthorized' }, 401)
+	if (!roles.some((role) => ADMIN_ROLES.has(role))) return c.json({ error: 'Forbidden' }, 403)
+	return null
+}
+
+const adminRoles = (account: Account): Array<'developer' | 'moderator'> => {
+	const roles: Array<'developer' | 'moderator'> = []
+	if (account.isDeveloper === true) roles.push('developer')
+	if (account.isModerator === true) roles.push('moderator')
+	return roles
+}
+
+function toAdminPlayerSummary(account: Account, isOnline: boolean, isBanned: boolean) {
+	return {
+		accountId: account.accountId,
+		username: account.username,
+		displayName: account.displayName,
+		createdAt: account.createdAt ?? null,
+		roles: adminRoles(account),
+		isOnline,
+		isBanned,
+	}
+}
+
+function toAdminPlayerDetail(account: Account, isOnline: boolean, isBanned: boolean) {
+	return {
+		...toAdminPlayerSummary(account, isOnline, isBanned),
+		email: account.email ?? null,
+		phone: account.phone ?? null,
+		deviceId: account.deviceId ?? null,
+		deviceClass: account.deviceClass ?? null,
+		platformId: account.platformId ?? null,
+		platform: account.platform ?? null,
+		lastLoginTime: account.lastLoginTime ?? null,
+	}
+}
+
+/** Strictly parse a non-negative safe integer query/path value. */
+function nonNegativeInteger(value: string | undefined): number | null {
+	if (value === undefined || !/^(?:0|[1-9]\d*)$/.test(value)) return null
+	const result = Number(value)
+	return Number.isSafeInteger(result) ? result : null
+}
+
 const app = new Hono<App>()
 	.use(
 		'*',
@@ -260,6 +320,160 @@ const app = new Hono<App>()
 			const name = c.req.query('name') ?? ''
 			const accounts = await searchAccounts(c.env.DB, name)
 			return c.json(accounts.map(toAccountDto))
+		}
+	)
+
+	// ---- Staff administration ------------------------------------------------
+	// This deliberately sits apart from the RecNet-compatible account routes above. It is an
+	// operational API for staff tools, not a new client contract.
+	.get(
+		'/admin/players',
+		describeRoute({
+			tags: ['Admin'],
+			summary: 'List players for staff administration',
+			description: [
+				'Staff-only, keyset-paginated account directory. `cursor` is the final account id',
+				'from the prior page. `q` prefix-matches usernames and also exactly matches a numeric',
+				'account id. Presence is live; ban state is the current direct account ban.',
+			].join(' '),
+			security: AUTHED,
+			parameters: [
+				{
+					name: 'q',
+					in: 'query',
+					required: false,
+					description: 'Username prefix or exact numeric account id; at most 100 characters',
+					schema: { type: 'string', maxLength: 100 },
+				},
+				{
+					name: 'cursor',
+					in: 'query',
+					required: false,
+					description: 'Non-negative final account id from the prior page',
+					schema: { type: 'integer', minimum: 0 },
+				},
+				{
+					name: 'limit',
+					in: 'query',
+					required: false,
+					description: 'Page size, from 1 through 100; defaults to 50',
+					schema: { type: 'integer', minimum: 1, maximum: 100, default: 50 },
+				},
+			],
+			responses: {
+				200: json(AdminPlayerDirectory, 'A bounded page of players'),
+				400: json(AdminErrorResponse, 'Invalid query parameters'),
+				401: json(AdminErrorResponse, 'Missing or invalid bearer token'),
+				403: json(AdminErrorResponse, 'Bearer token has no staff role'),
+			},
+		}),
+		async (c) => {
+			const authError = await requireAdmin(c)
+			if (authError) return authError
+
+			const query = c.req.query('q') ?? ''
+			if (query.length > 100) return c.json({ error: 'q must be at most 100 characters' }, 400)
+			const cursorParam = c.req.query('cursor')
+			const cursor = cursorParam === undefined ? 0 : nonNegativeInteger(cursorParam)
+			if (cursor === null) return c.json({ error: 'cursor must be a non-negative integer' }, 400)
+			const limitParam = c.req.query('limit')
+			const limit = limitParam === undefined ? 50 : nonNegativeInteger(limitParam)
+			if (limit === null || limit < 1 || limit > 100) {
+				return c.json({ error: 'limit must be an integer from 1 through 100' }, 400)
+			}
+
+			const page = await listAccountsForAdmin(c.env.DB, { query, cursor, limit })
+			const ids = page.accounts.map((account) => account.accountId)
+			const [presences, bannedIds] = await Promise.all([
+				getPresences(c.env.DB, ids),
+				getDirectlyBannedAccountIds(c.env.DB, ids),
+			])
+			return c.json({
+				players: page.accounts.map((account) =>
+					toAdminPlayerSummary(
+						account,
+						presences.has(account.accountId),
+						bannedIds.has(account.accountId)
+					)
+				),
+				nextCursor: page.nextCursor,
+			})
+		}
+	)
+	.post(
+		'/admin/players/:id/roles',
+		describeRoute({
+			tags: ['Admin'],
+			summary: 'Grant or revoke a player staff role',
+			description:
+				'Staff-only. Changes one of the developer/moderator role flags on an existing account.',
+			security: AUTHED,
+			requestBody: jsonBody(
+				AdminRoleMutationRequest,
+				'The staff role to change and whether it is granted'
+			),
+			responses: {
+				200: json(AdminPlayerSummary, 'Updated player summary'),
+				400: json(AdminErrorResponse, 'Invalid account id or role mutation body'),
+				401: json(AdminErrorResponse, 'Missing or invalid bearer token'),
+				403: json(AdminErrorResponse, 'Bearer token has no staff role'),
+				404: json(AdminErrorResponse, 'No account exists for the id'),
+			},
+		}),
+		async (c) => {
+			const authError = await requireAdmin(c)
+			if (authError) return authError
+
+			const accountId = nonNegativeInteger(c.req.param('id'))
+			if (accountId === null) return c.json({ error: 'id must be a non-negative integer' }, 400)
+			const body = AdminRoleMutationRequest.safeParse(await c.req.json().catch(() => null))
+			if (!body.success) {
+				return c.json({ error: 'role must be developer or moderator and grant a boolean' }, 400)
+			}
+			const account = await getAccount(c.env.DB, accountId)
+			if (!account) return c.json({ error: 'No such account' }, 404)
+			const { role, grant } = body.data
+			const updated = await updateAccount(
+				c.env.DB,
+				accountId,
+				role === 'developer' ? { isDeveloper: grant } : { isModerator: grant }
+			)
+			const [presence, bannedIds] = await Promise.all([
+				getPresence(c.env.DB, accountId),
+				getDirectlyBannedAccountIds(c.env.DB, [accountId]),
+			])
+			return c.json(toAdminPlayerSummary(updated, presence !== null, bannedIds.has(accountId)))
+		}
+	)
+	.get(
+		'/admin/players/:id',
+		describeRoute({
+			tags: ['Admin'],
+			summary: 'Get staff operational player details',
+			description:
+				'Staff-only account details including contact, last-login, device, platform and role fields. Credential hashes are never returned.',
+			security: AUTHED,
+			responses: {
+				200: json(AdminPlayerDetail, 'Operational player details'),
+				400: json(AdminErrorResponse, 'Invalid account id'),
+				401: json(AdminErrorResponse, 'Missing or invalid bearer token'),
+				403: json(AdminErrorResponse, 'Bearer token has no staff role'),
+				404: json(AdminErrorResponse, 'No account exists for the id'),
+			},
+		}),
+		async (c) => {
+			const authError = await requireAdmin(c)
+			if (authError) return authError
+
+			const accountId = nonNegativeInteger(c.req.param('id'))
+			if (accountId === null) return c.json({ error: 'id must be a non-negative integer' }, 400)
+			const account = await getAccount(c.env.DB, accountId)
+			if (!account) return c.json({ error: 'No such account' }, 404)
+			const [presence, bannedIds] = await Promise.all([
+				getPresence(c.env.DB, accountId),
+				getDirectlyBannedAccountIds(c.env.DB, [accountId]),
+			])
+			return c.json(toAdminPlayerDetail(account, presence !== null, bannedIds.has(accountId)))
 		}
 	)
 

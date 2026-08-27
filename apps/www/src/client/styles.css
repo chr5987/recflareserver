@@ -1080,6 +1080,124 @@ button[type='submit']:disabled {
 	color: var(--ok);
 }
 
+/* ---- Staff player directory --------------------------------------------- */
+
+.player-search {
+	display: flex;
+	gap: 8px;
+	margin: 16px 0;
+}
+
+.player-search input {
+	flex: 1;
+	min-width: 0;
+}
+
+.player-list,
+.moderation-history {
+	list-style: none;
+	margin: 16px 0;
+	padding: 0;
+}
+
+.player-list {
+	border-top: 1px solid var(--line);
+}
+
+.player-list li {
+	border-bottom: 1px solid var(--line);
+}
+
+.player-list button {
+	display: flex;
+	width: 100%;
+	justify-content: space-between;
+	align-items: center;
+	gap: 12px;
+	padding: 12px 0;
+	border: 0;
+	border-radius: 0;
+	background: transparent;
+	color: var(--text);
+	text-align: left;
+}
+
+.player-list button:hover,
+.player-list button.selected {
+	color: var(--accent);
+}
+
+.player-list small {
+	display: block;
+	color: var(--muted);
+}
+
+.player-state,
+.role-actions {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 6px;
+}
+
+.badge.danger {
+	color: var(--error);
+	border-color: color-mix(in srgb, var(--error) 45%, transparent);
+}
+
+.load-more {
+	display: block;
+	margin: 16px auto 0;
+}
+
+.player-detail {
+	margin-top: 24px;
+	padding-top: 24px;
+	border-top: 1px solid var(--line);
+}
+
+.player-detail h3 {
+	font-family: var(--display);
+	font-size: 1rem;
+	margin: 20px 0 10px;
+}
+
+.player-detail .facts {
+	margin-bottom: 20px;
+}
+
+.admin-actions {
+	display: grid;
+	gap: 14px;
+}
+
+.admin-actions form {
+	display: grid;
+	gap: 8px;
+}
+
+.admin-actions label {
+	display: grid;
+	gap: 4px;
+	font-size: 0.875rem;
+}
+
+.admin-actions button,
+.role-actions button {
+	width: fit-content;
+}
+
+.danger-button {
+	background: var(--error);
+	color: #fff;
+}
+
+.moderation-history li {
+	padding: 8px 0;
+	border-bottom: 1px solid var(--line);
+	font-size: 0.875rem;
+}
+
 /* ---- Responsive --------------------------------------------------------- */
 
 @media (max-width: 860px) {
@@ -1137,6 +1255,11 @@ button[type='submit']:disabled {
 
 	.facts dd {
 		margin-bottom: 10px;
+	}
+
+	.player-list button {
+		align-items: flex-start;
+		flex-direction: column;
 	}
 }
 
