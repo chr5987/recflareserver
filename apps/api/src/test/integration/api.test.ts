@@ -2994,6 +2994,115 @@ describe('player warnings', () => {
 	})
 })
 
+// The standalone `admin` worker's ban panel calls these. Distinct from the warning
+// routes above: those accept moderator OR developer, these accept `developer` only — so
+// these tests specifically pin that a moderator-only token is refused here, not just an
+// anonymous one.
+describe('admin ban routes (developer-only)', () => {
+	const DEV = ['gameClient', 'developer']
+	const MOD_ONLY = ['gameClient', 'moderator']
+
+	test('GET /admin/bans/:playerId 401s with no token', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/admin/bans/9200`)
+		expect(res.status).toBe(401)
+	})
+
+	test('GET /admin/bans/:playerId 403s for a moderator-only token', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/admin/bans/9200`, {
+			headers: await bearer('42', MOD_ONLY),
+		})
+		expect(res.status).toBe(403)
+	})
+
+	test('GET /admin/bans/:playerId reports no active ban for a clean player', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/admin/bans/9201`, {
+			headers: await bearer('42', DEV),
+		})
+		expect(res.status).toBe(200)
+		expect(await res.json()).toMatchObject({ activeBan: null, reports: [] })
+	})
+
+	test('POST /admin/bans/:playerId with no duration bans permanently', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/admin/bans/9202`, {
+			method: 'POST',
+			headers: { ...(await bearer('42', DEV)), 'content-type': 'application/json' },
+			body: JSON.stringify({ reason: 'griefing' }),
+		})
+		expect(res.status).toBe(200)
+		const body = (await res.json()) as { activeBan: { banned: number; ban_expires: string | null } }
+		expect(body.activeBan).toMatchObject({ banned: 1, ban_expires: null })
+		expect(await isPlayerBanned(env.DB, 9202)).toBe(true)
+
+		// The report row is attributed to the acting developer (the token's subject),
+		// carrying the reason as its details — same as any other report.
+		const [row] = await getReportsAgainst(env.DB, 9202)
+		expect(row).toMatchObject({ reporter_player_id: 42, reported_player_id: 9202, details: 'griefing' })
+	})
+
+	test('POST /admin/bans/:playerId with durationDays sets a future expiry', async () => {
+		const before = Date.now()
+		const res = await exports.default.fetch(`${ORIGIN}/admin/bans/9203`, {
+			method: 'POST',
+			headers: { ...(await bearer('42', DEV)), 'content-type': 'application/json' },
+			body: JSON.stringify({ durationDays: 7 }),
+		})
+		expect(res.status).toBe(200)
+		const body = (await res.json()) as { activeBan: { ban_expires: string } }
+		const expiresAt = new Date(body.activeBan.ban_expires).getTime()
+		// Roughly 7 days out — generous bounds so clock skew in CI can't flake this.
+		expect(expiresAt).toBeGreaterThan(before + 6 * 86_400_000)
+		expect(expiresAt).toBeLessThan(before + 8 * 86_400_000)
+	})
+
+	test('POST /admin/bans/:playerId with permanent:true ignores durationDays', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/admin/bans/9204`, {
+			method: 'POST',
+			headers: { ...(await bearer('42', DEV)), 'content-type': 'application/json' },
+			body: JSON.stringify({ permanent: true, durationDays: 3 }),
+		})
+		expect(res.status).toBe(200)
+		const body = (await res.json()) as { activeBan: { ban_expires: string | null } }
+		expect(body.activeBan.ban_expires).toBeNull()
+	})
+
+	test('POST /admin/bans/:playerId 403s for a moderator-only token', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/admin/bans/9205`, {
+			method: 'POST',
+			headers: { ...(await bearer('42', MOD_ONLY)), 'content-type': 'application/json' },
+			body: JSON.stringify({}),
+		})
+		expect(res.status).toBe(403)
+		expect(await isPlayerBanned(env.DB, 9205)).toBe(false)
+	})
+
+	test('POST /admin/bans/:playerId/lift clears an active ban', async () => {
+		await exports.default.fetch(`${ORIGIN}/admin/bans/9206`, {
+			method: 'POST',
+			headers: { ...(await bearer('42', DEV)), 'content-type': 'application/json' },
+			body: JSON.stringify({}),
+		})
+		expect(await isPlayerBanned(env.DB, 9206)).toBe(true)
+
+		const res = await exports.default.fetch(`${ORIGIN}/admin/bans/9206/lift`, {
+			method: 'POST',
+			headers: await bearer('42', DEV),
+		})
+		expect(res.status).toBe(200)
+		const body = (await res.json()) as { liftedBan: { banned: number } }
+		expect(body.liftedBan).toMatchObject({ banned: 0 })
+		expect(await isPlayerBanned(env.DB, 9206)).toBe(false)
+	})
+
+	test('POST /admin/bans/:playerId/lift is a no-op for a player who is not banned', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/admin/bans/9207/lift`, {
+			method: 'POST',
+			headers: await bearer('42', DEV),
+		})
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual({ liftedBan: null })
+	})
+})
+
 describe('rooms', () => {
 	test('POST /api/rooms/v1/verifyRole checks creator + room roles', async () => {
 		const verify = async (fields: Record<string, string>, sub?: string): Promise<boolean> => {

@@ -1,0 +1,10 @@
+{
+	"extends": "@repo/typescript-config/workers.json",
+	"compilerOptions": {
+		// The React client code needs the automatic JSX runtime and the DOM libs. The
+		// worker code itself uses no DOM globals, so widening `lib` here is harmless
+		// (same as `www`'s tsconfig).
+		"jsx": "react-jsx",
+		"lib": ["ESNext", "DOM", "DOM.Iterable"]
+	}
+}
