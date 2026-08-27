@@ -448,6 +448,20 @@ export class NotificationsHub extends DurableObject<Env> {
 		return { sent: this.broadcastToConnected(payload) }
 	}
 
+	/**
+	 * Send an online-only Coach message to one player's subscribed live sockets. This uses
+	 * the same message frame as the server-wide Coach broadcast, but never queues a message
+	 * for a player who is no longer connected.
+	 */
+	async coachMessage(playerId: number, content: string): Promise<{ sent: number }> {
+		const payload = this.buildNotificationPayload(NotificationType.MessageReceived, {
+			FromPlayerId: COACH_PLAYER_ID,
+			Type: COACH_MESSAGE_TYPE,
+			Data: content,
+		})
+		return { sent: this.deliverToPlayer(playerId, payload) }
+	}
+
 	/** Broadcast a notification to every connected (handshaken) client. */
 	async broadcast(
 		notificationType: string | number,

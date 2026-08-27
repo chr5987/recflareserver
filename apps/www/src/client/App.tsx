@@ -62,6 +62,45 @@ interface SelfAccount {
 	availableUsernameChanges?: number
 }
 
+interface AdminPlayer {
+	accountId: number
+	username: string
+	displayName: string
+	createdAt: string | null
+	roles: Array<'developer' | 'moderator'>
+	isOnline: boolean
+	isBanned: boolean
+}
+
+interface AdminPlayerDetail extends AdminPlayer {
+	email: string | null
+	phone: string | null
+	deviceId: string | null
+	deviceClass: number | null
+	platformId: string | null
+	platform: number | null
+	lastLoginTime: string | null
+}
+
+interface ModerationHistory {
+	reports: Array<{
+		id: number
+		reporter_player_id: number
+		details: string | null
+		created_at: string
+		banned: number
+		ban_expires: string | null
+	}>
+	warnings: Array<{
+		id: number
+		moderator_player_id: number
+		display_reason: string | null
+		moderator_note: string | null
+		created_at: string
+	}>
+	activeBan: { id: number; details: string | null; ban_expires: string | null } | null
+}
+
 /**
  * One subroom, as `rooms` re-attaches them to every room read. A room is a container;
  * the subrooms are the actual places players load into, each with its own accessibility
@@ -234,7 +273,7 @@ function errorMessage(data: Record<string, unknown>, status: number): string {
 }
 
 interface CallOptions {
-	method?: 'GET' | 'POST' | 'PUT'
+	method?: 'GET' | 'POST' | 'PUT' | 'DELETE'
 	/** Form fields — auth and accounts read their input with Hono's `parseBody()`. */
 	form?: Record<string, string>
 	/** A JSON body — what notify's internal endpoints take instead. */
@@ -515,6 +554,60 @@ const coachMessageAll = (messageContent: string): Promise<{ sent?: number }> =>
 		json: { messageContent },
 		authed: true,
 	})
+
+const fetchAdminPlayers = (query: string, cursor?: number): Promise<{
+	players: AdminPlayer[]
+	nextCursor: number | null
+}> => {
+	const params = new URLSearchParams({ q: query })
+	if (cursor !== undefined) params.set('cursor', String(cursor))
+	return call(`${where().accounts}/admin/players?${params}`, { authed: true })
+}
+
+const fetchAdminPlayer = (accountId: number): Promise<AdminPlayerDetail> =>
+	call(`${where().accounts}/admin/players/${accountId}`, { authed: true })
+
+const fetchModeration = (accountId: number): Promise<ModerationHistory> =>
+	call(`${where().api}/api/admin/players/${accountId}/moderation`, { authed: true })
+
+const setPlayerRole = (
+	accountId: number,
+	role: 'developer' | 'moderator',
+	grant: boolean
+): Promise<AdminPlayer> =>
+	call(`${where().accounts}/admin/players/${accountId}/roles`, {
+		json: { role, grant },
+		authed: true,
+	})
+
+const coachMessagePlayer = (playerId: number, messageContent: string): Promise<{ sent?: number }> =>
+	call(`${where().notify}/internal/coach-message`, {
+		json: { playerId, messageContent },
+		authed: true,
+	})
+
+const warnPlayer = (
+	playerId: number,
+	displayReason: string,
+	moderatorNote: string
+): Promise<{ success: boolean; error: string }> =>
+	call(`${where().api}/api/playerwarnings`, {
+		form: {
+			WarnedPlayerId: String(playerId),
+			DisplayReason: displayReason,
+			ModeratorNote: moderatorNote,
+		},
+		authed: true,
+	})
+
+const banPlayer = (playerId: number, reason: string): Promise<unknown> =>
+	call(`${where().api}/api/admin/players/${playerId}/ban`, {
+		json: { reason },
+		authed: true,
+	})
+
+const liftPlayerBan = (playerId: number): Promise<unknown> =>
+	call(`${where().api}/api/admin/players/${playerId}/ban`, { method: 'DELETE', authed: true })
 
 /** Minimal history-based router: current pathname + a navigate() that pushes state. */
 function useRouter() {
@@ -1802,6 +1895,7 @@ function Dashboard({
 		{ id: 'password', label: 'Password', render: () => <PasswordForm /> },
 		...(isAdmin()
 			? [
+					{ id: 'players', label: 'Players', render: () => <AdminPlayers /> },
 					{ id: 'maintenance', label: 'Server maintenance', render: () => <MaintenanceForm /> },
 					{ id: 'coach', label: 'Broadcast message', render: () => <CoachMessageForm /> },
 				]
@@ -1935,6 +2029,200 @@ function RoomCard({
 				</div>
 			</Link>
 		</li>
+	)
+}
+
+/** Staff-only account directory and per-player operational controls. */
+function AdminPlayers() {
+	const [query, setQuery] = useState('')
+	const [appliedQuery, setAppliedQuery] = useState('')
+	const [players, setPlayers] = useState<AdminPlayer[] | null>(null)
+	const [nextCursor, setNextCursor] = useState<number | null>(null)
+	const [error, setError] = useState('')
+	const [selectedId, setSelectedId] = useState<number | null>(null)
+
+	const load = useCallback(async (q: string, cursor?: number) => {
+		setError('')
+		try {
+			const page = await fetchAdminPlayers(q, cursor)
+			setPlayers((current) => (cursor === undefined ? page.players : [...(current ?? []), ...page.players]))
+			setNextCursor(page.nextCursor)
+		} catch (err) {
+			setError(err instanceof Error ? err.message : String(err))
+		}
+	}, [])
+
+	useEffect(() => {
+		void load('', undefined)
+	}, [load])
+
+	return (
+		<section className="card admin-players">
+			<h2>Players</h2>
+			<p className="muted">Find a player to inspect their account, message them, or take staff action.</p>
+			<form
+				className="player-search"
+				onSubmit={(e) => {
+					e.preventDefault()
+					const next = query.trim()
+					setAppliedQuery(next)
+					setSelectedId(null)
+					void load(next, undefined)
+				}}
+			>
+				<input
+					type="search"
+					value={query}
+					onChange={(e) => setQuery(e.target.value)}
+					placeholder="Username or player ID"
+					aria-label="Search players"
+				/>
+				<button type="submit">Search</button>
+			</form>
+			{error ? (
+				<p className="error">{error}</p>
+			) : players === null ? (
+				<p className="muted">Loading players…</p>
+			) : players.length === 0 ? (
+				<p className="muted">No players match {appliedQuery ? `"${appliedQuery}".` : 'this directory.'}</p>
+			) : (
+				<>
+					<ul className="player-list">
+						{players.map((player) => (
+							<li key={player.accountId}>
+								<button
+									type="button"
+									className={selectedId === player.accountId ? 'selected' : ''}
+									onClick={() => setSelectedId(player.accountId)}
+								>
+									<span>
+										<strong>{player.displayName || player.username}</strong>
+										<small>
+											@{player.username} · #{player.accountId}
+										</small>
+									</span>
+									<span className="player-state">
+										{player.isOnline && <span className="badge live">Online</span>}
+										{player.isBanned && <span className="badge danger">Banned</span>}
+										{player.roles.map((role) => (
+											<span className="badge" key={role}>
+												{role}
+											</span>
+										))}
+									</span>
+								</button>
+							</li>
+						))}
+					</ul>
+					{nextCursor !== null && (
+						<button type="button" className="load-more" onClick={() => void load(appliedQuery, nextCursor)}>
+							Load more
+						</button>
+					)}
+				</>
+			)}
+			{selectedId !== null && <AdminPlayerDetailPanel accountId={selectedId} />}
+		</section>
+	)
+}
+
+function AdminPlayerDetailPanel({ accountId }: { accountId: number }) {
+	const [player, setPlayer] = useState<AdminPlayerDetail | null>(null)
+	const [history, setHistory] = useState<ModerationHistory | null>(null)
+	const [error, setError] = useState('')
+	const [message, setMessage] = useState('')
+	const [warning, setWarning] = useState('')
+	const [note, setNote] = useState('')
+	const [banReason, setBanReason] = useState('')
+	const { pending, done, run } = useAction()
+
+	const load = useCallback(async () => {
+		setError('')
+		try {
+			const [detail, moderation] = await Promise.all([
+				fetchAdminPlayer(accountId),
+				fetchModeration(accountId),
+			])
+			setPlayer(detail)
+			setHistory(moderation)
+		} catch (err) {
+			setError(err instanceof Error ? err.message : String(err))
+		}
+	}, [accountId])
+
+	useEffect(() => {
+		setPlayer(null)
+		setHistory(null)
+		void load()
+	}, [load])
+
+	if (error) return <p className="error">{error}</p>
+	if (!player || !history) return <p className="muted">Loading player details…</p>
+	const formatDate = (value: string | null) => (value ? new Date(value).toLocaleString() : '—')
+
+	return (
+		<div className="player-detail">
+			<h3>{player.displayName || player.username}</h3>
+			<dl className="facts">
+				<dt>Player ID</dt><dd>#{player.accountId}</dd>
+				<dt>Created</dt><dd>{formatDate(player.createdAt)}</dd>
+				<dt>Last login</dt><dd>{formatDate(player.lastLoginTime)}</dd>
+				<dt>Email</dt><dd>{player.email || '—'}</dd>
+				<dt>Platform</dt><dd>{player.platform ?? '—'} {player.platformId ?? ''}</dd>
+				<dt>Device</dt><dd>{player.deviceId || '—'}</dd>
+			</dl>
+			<div className="admin-actions">
+				<form onSubmit={(e) => { e.preventDefault(); void run(async () => {
+					const result = await coachMessagePlayer(player.accountId, message.trim())
+					setMessage('')
+					return `Message sent to ${result.sent ?? 0} live connection${result.sent === 1 ? '' : 's'}.`
+				}) }}>
+					<label>Coach message<input value={message} onChange={(e) => setMessage(e.target.value)} required /></label>
+					<button type="submit" disabled={pending}>Send message</button>
+				</form>
+				<form onSubmit={(e) => { e.preventDefault(); void run(async () => {
+					const result = await warnPlayer(player.accountId, warning.trim(), note.trim())
+					if (!result.success) throw new Error(result.error || 'Warning was refused.')
+					setWarning(''); setNote(''); await load()
+					return 'Warning recorded.'
+				}) }}>
+					<label>Warning reason<input value={warning} onChange={(e) => setWarning(e.target.value)} required /></label>
+					<label>Staff note<input value={note} onChange={(e) => setNote(e.target.value)} /></label>
+					<button type="submit" disabled={pending}>Issue warning</button>
+				</form>
+				<div className="role-actions">
+					<strong>Roles</strong>
+					{(['developer', 'moderator'] as const).map((role) => {
+						const granted = player.roles.includes(role)
+						return <button key={role} type="button" disabled={pending} onClick={() => void run(async () => {
+							const updated = await setPlayerRole(player.accountId, role, !granted)
+							setPlayer((current) => current ? { ...current, roles: updated.roles } : current)
+							return `${role[0]!.toUpperCase()}${role.slice(1)} role ${granted ? 'revoked' : 'granted'}.`
+						})}>{granted ? `Revoke ${role}` : `Grant ${role}`}</button>
+					})}
+				</div>
+				{history.activeBan ? (
+					<button type="button" className="danger-button" disabled={pending} onClick={() => void run(async () => {
+						await liftPlayerBan(player.accountId); await load(); return 'Ban lifted.'
+					})}>Lift ban</button>
+				) : (
+					<form onSubmit={(e) => { e.preventDefault(); void run(async () => {
+						await banPlayer(player.accountId, banReason.trim()); setBanReason(''); await load(); return 'Player banned.'
+					}) }}>
+						<label>Ban reason<input value={banReason} onChange={(e) => setBanReason(e.target.value)} required /></label>
+						<button type="submit" className="danger-button" disabled={pending}>Ban player</button>
+					</form>
+				)}
+			</div>
+			{done && <p className="ok">{done}</p>}
+			<h3>Moderation history</h3>
+			{history.warnings.length === 0 && history.reports.length === 0 ? <p className="muted">No warnings or reports.</p> : (
+				<ul className="moderation-history">
+					{history.warnings.map((item) => <li key={`warning-${item.id}`}>Warning · {item.display_reason || 'No reason'} · {formatDate(item.created_at)}</li>)}
+					{history.reports.map((item) => <li key={`report-${item.id}`}>Report{item.banned ? ' / ban' : ''} · {item.details || 'No details'} · {formatDate(item.created_at)}</li>)}
+				</ul>
+			)}
+		</div>
 	)
 }
 

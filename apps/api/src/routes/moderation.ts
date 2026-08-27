@@ -16,8 +16,8 @@ import {
 	UNAUTHORIZED_RESPONSE,
 	VoteToKickReason,
 } from '../openapi'
-import { createReport } from '../reports-db'
-import { createWarning } from '../warnings-db'
+import { banFromReport, createReport, getActiveBan, getReportsAgainst } from '../reports-db'
+import { createWarning, getWarningsAgainst } from '../warnings-db'
 
 import type { Context } from 'hono'
 import type { App } from '../context'
@@ -29,6 +29,21 @@ import type { App } from '../context'
  * their admin surfaces on: a warning is a moderation action, but staff hold both.
  */
 const MODERATOR_ROLES = new Set(['moderator', 'developer'])
+
+/** Require one of the elevated moderation roles for the staff-only admin UI routes. */
+async function requireModerator(c: Context<App>): Promise<number | null> {
+	const moderatorId = await authedId(c)
+	if (moderatorId === null) return null
+	const roles = await authedRoles(c)
+	return roles?.some((role) => MODERATOR_ROLES.has(role)) ? moderatorId : -1
+}
+
+const adminPlayerId = (c: Context<App>): number | null => {
+	const raw = c.req.param('id')
+	if (raw === undefined) return null
+	const playerId = Number.parseInt(raw, 10)
+	return Number.isInteger(playerId) && playerId >= 0 ? playerId : null
+}
 
 /**
  * Read one field of a submitted form. The client posts these form-encoded, but the
@@ -84,6 +99,59 @@ const VOTE_TO_KICK_REASONS = [
 
 // ---- Player reporting ------------------------------------------------------
 export const moderationRoutes = new Hono<App>({ strict: false })
+	// ---- Staff administration -------------------------------------------------
+	// This is intentionally separate from the game-client reporting routes below: those
+	// preserve their recovered RecNet request/response contracts, while this is the web
+	// administration surface that needs history and explicit actions.
+	.get('/api/admin/players/:id/moderation', async (c) => {
+		const moderatorId = await requireModerator(c)
+		if (moderatorId === null) return unauthorized(c)
+		if (moderatorId === -1) return c.json({ error: 'Forbidden' }, 403)
+		const playerId = adminPlayerId(c)
+		if (playerId === null) return c.json({ error: 'player id must be a non-negative integer' }, 400)
+
+		const [reports, warnings, activeBan] = await Promise.all([
+			getReportsAgainst(c.env.DB, playerId),
+			getWarningsAgainst(c.env.DB, playerId),
+			getActiveBan(c.env.DB, playerId),
+		])
+		return c.json({ reports, warnings, activeBan })
+	})
+	.post('/api/admin/players/:id/ban', async (c) => {
+		const moderatorId = await requireModerator(c)
+		if (moderatorId === null) return unauthorized(c)
+		if (moderatorId === -1) return c.json({ error: 'Forbidden' }, 403)
+		const playerId = adminPlayerId(c)
+		if (playerId === null) return c.json({ error: 'player id must be a non-negative integer' }, 400)
+
+		const body = await c.req.json<{ reason?: unknown; expiresAt?: unknown }>().catch(() => null)
+		const reason = typeof body?.reason === 'string' ? body.reason.trim() : ''
+		if (reason === '') return c.json({ error: 'reason is required' }, 400)
+		const expiresAt = typeof body?.expiresAt === 'string' && body.expiresAt !== '' ? body.expiresAt : null
+		if (expiresAt !== null && Number.isNaN(Date.parse(expiresAt))) {
+			return c.json({ error: 'expiresAt must be an ISO-8601 date' }, 400)
+		}
+
+		const report = await createReport(c.env.DB, {
+			reporterPlayerId: moderatorId,
+			reportedPlayerId: playerId,
+			details: reason,
+		})
+		const ban = await banFromReport(c.env.DB, report.id, { banExpires: expiresAt })
+		return c.json({ success: true, ban })
+	})
+	.delete('/api/admin/players/:id/ban', async (c) => {
+		const moderatorId = await requireModerator(c)
+		if (moderatorId === null) return unauthorized(c)
+		if (moderatorId === -1) return c.json({ error: 'Forbidden' }, 403)
+		const playerId = adminPlayerId(c)
+		if (playerId === null) return c.json({ error: 'player id must be a non-negative integer' }, 400)
+
+		const activeBan = await getActiveBan(c.env.DB, playerId)
+		if (activeBan === null) return c.json({ error: 'Player is not currently banned' }, 404)
+		await banFromReport(c.env.DB, activeBan.id, { banned: false })
+		return c.json({ success: true })
+	})
 	// Whether the caller is currently blocked (banned / timed out / host-kicked). Bans
 	// are stored (a report row with `banned` set) and enforced at matchmake and at login,
 	// but this endpoint is not wired to them, so it's always the "not blocked" answer —

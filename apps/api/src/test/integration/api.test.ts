@@ -58,7 +58,7 @@ import {
 	spendCheerCredit,
 } from '../../reputation-db'
 import { charadesWordsFor } from '../../routes/gameplay'
-import { getWarningsAgainst, SCHEMA_DDL as WARNINGS_SCHEMA_DDL } from '../../warnings-db'
+import { createWarning, getWarningsAgainst, SCHEMA_DDL as WARNINGS_SCHEMA_DDL } from '../../warnings-db'
 
 import type { SavedImage } from '@repo/domain'
 import type { Env } from '../../context'
@@ -2900,6 +2900,81 @@ describe('player reports', () => {
 	// No such report — the caller can tell that from having banned nobody.
 	test('banFromReport returns null for an unknown report', async () => {
 		expect(await banFromReport(env.DB, 999_999)).toBeNull()
+	})
+})
+
+describe('admin player moderation', () => {
+	const MOD = ['gameClient', 'moderator']
+
+	const request = (path: string, init: RequestInit = {}) =>
+		exports.default.fetch(`${ORIGIN}${path}`, init)
+
+	test('lists a player’s warnings, reports, and active ban for staff only', async () => {
+		await createReport(env.DB, {
+			reporterPlayerId: 2,
+			reportedPlayerId: 230,
+			details: 'prior report',
+		})
+		await createWarning(env.DB, {
+			moderatorPlayerId: 2,
+			warnedPlayerId: 230,
+			displayReason: 'prior warning',
+		})
+
+		const unauthorized = await request('/api/admin/players/230/moderation')
+		expect(unauthorized.status).toBe(401)
+		const forbidden = await request('/api/admin/players/230/moderation', {
+			headers: await bearer('42', ['gameClient']),
+		})
+		expect(forbidden.status).toBe(403)
+
+		const res = await request('/api/admin/players/230/moderation', {
+			headers: await bearer('42', MOD),
+		})
+		expect(res.status).toBe(200)
+		expect(await res.json()).toMatchObject({
+			reports: [{ reported_player_id: 230, details: 'prior report' }],
+			warnings: [{ warned_player_id: 230, display_reason: 'prior warning' }],
+			activeBan: null,
+		})
+	})
+
+	test('creates an evidence-backed global ban and lifts it', async () => {
+		const headers = { 'Content-Type': 'application/json', ...(await bearer('42', MOD)) }
+		const ban = await request('/api/admin/players/231/ban', {
+			method: 'POST',
+			headers,
+			body: JSON.stringify({ reason: 'Repeated harassment' }),
+		})
+		expect(ban.status).toBe(200)
+		expect(await ban.json()).toMatchObject({
+			success: true,
+			ban: { reported_player_id: 231, reporter_player_id: 42, details: 'Repeated harassment', banned: 1 },
+		})
+		expect(await isPlayerBanned(env.DB, 231)).toBe(true)
+
+		const lift = await request('/api/admin/players/231/ban', {
+			method: 'DELETE',
+			headers: await bearer('42', MOD),
+		})
+		expect(lift.status).toBe(200)
+		expect(await lift.json()).toEqual({ success: true })
+		expect(await isPlayerBanned(env.DB, 231)).toBe(false)
+	})
+
+	test('requires a reason and valid staff credential to ban', async () => {
+		const noReason = await request('/api/admin/players/232/ban', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json', ...(await bearer('42', MOD)) },
+			body: '{}',
+		})
+		expect(noReason.status).toBe(400)
+		const forbidden = await request('/api/admin/players/232/ban', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json', ...(await bearer('42', ['gameClient'])) },
+			body: JSON.stringify({ reason: 'reason' }),
+		})
+		expect(forbidden.status).toBe(403)
 	})
 })
 
