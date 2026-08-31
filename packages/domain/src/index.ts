@@ -1,4 +1,11 @@
-export { RoomInstanceType, Accessibility, Role, MessageType, MatchmakingErrorCode } from './enums'
+export {
+	RoomInstanceType,
+	Accessibility,
+	Role,
+	MessageType,
+	InviteMode,
+	MatchmakingErrorCode,
+} from './enums'
 export * from './accounts-db'
 export * from './clubs-db'
 export * from './images-db'
@@ -8,6 +15,7 @@ export * from './room-instance-db'
 export * from './room-comments-db'
 export * from './room-invites-db'
 export * from './presence-db'
+export * from './stats-db'
 export * from './gifts-db'
 export * from './inventory-invention-db'
 export * from './lists-db'

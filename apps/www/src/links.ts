@@ -8,16 +8,16 @@
  */
 
 /** The community Discord — the join instructions and the build both live there. */
-export const DISCORD_INVITE = 'https://discord.gg/HhmMAKhrz'
+export const DISCORD_INVITE = 'https://join.recflare.net'
 
 /** Where the stage's "Download for PC" button goes: the client's release listing. */
-export const DOWNLOAD_URL = 'https://github.com/djdevin/recflare-client/releases'
+export const DOWNLOAD_URL = 'https://github.com/recflare/client/releases'
 
 /** The stage's "Download for Quest" button: the build's listing on the Meta store. */
 export const QUEST_DOWNLOAD_URL = 'https://www.meta.com/s/6lL20Fnhz'
 
 /** The public source repo, linked from the homepage and footer. */
-export const SOURCE_REPO = 'https://github.com/djdevin/recflare'
+export const SOURCE_REPO = 'https://github.com/orgs/recflare/repositories'
 
 /** The repo's licence, behind the footer's "MIT licensed". */
 export const LICENSE_URL = `${SOURCE_REPO}/blob/main/LICENSE`
