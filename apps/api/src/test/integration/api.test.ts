@@ -63,7 +63,11 @@ import { createWarning, getWarningsAgainst, SCHEMA_DDL as WARNINGS_SCHEMA_DDL } 
 import type { SavedImage } from '@repo/domain'
 import type { Env } from '../../context'
 import type { EventTag, PlayerEvent, PlayerEventEnvelope, PlayerEventResult } from '../../events-db'
-import type { InventionSaveResult, SavedInvention } from '../../inventions-db'
+import type {
+	InventionSaveResult,
+	InventionSaveV9Result,
+	SavedInvention,
+} from '../../inventions-db'
 
 declare module 'cloudflare:test' {
 	interface ProvidedEnv extends Env {}
@@ -1001,6 +1005,27 @@ describe('public endpoints', () => {
 		}
 	})
 
+	test('GET /api/CircuitChipLists/:list is empty for any name', async () => {
+		// A palette on the Maker Pen's circuit board, named by the path. Nothing records which
+		// chips a player has used or favourited, so every one of them is empty — including names
+		// this server has never heard of, which the client will ask for as its build changes.
+		// An unknown name being a 404 would render as a palette that FAILED to load rather than
+		// one with nothing in it.
+		for (const list of [
+			'Favorites',
+			'Recent',
+			'All',
+			'SomePaletteThisServerHasNeverHeardOf',
+			// Path-segment oddities: a name that needs escaping, and a numeric one.
+			encodeURIComponent('Weird Name/With Slash'),
+			'42',
+		]) {
+			const res = await exports.default.fetch(`${ORIGIN}/api/CircuitChipLists/${list}`)
+			expect(res.status, list).toBe(200)
+			expect(await res.json(), list).toEqual([])
+		}
+	})
+
 	test('GET /api/inventions/v1/featureddormskins returns []', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/api/inventions/v1/featureddormskins`)
 		expect(res.status).toBe(200)
@@ -1050,6 +1075,209 @@ describe('public endpoints', () => {
 				thumbnailImageFilename: 'thumb_x.png',
 			}
 		}
+	})
+
+	test('GET /api/customAvatarItems/v1/search filters, pages and excludes unpublished', async () => {
+		await env.DB.prepare('DELETE FROM custom_avatar_item').run()
+
+		const search = async (query: string) => {
+			const res = await exports.default.fetch(`${ORIGIN}/api/customAvatarItems/v1/search${query}`)
+			expect(res.status, query).toBe(200)
+			return (await res.json()) as Array<{
+				CustomAvatarItemId: string
+				Name: string
+				OutfitType: number
+				PurchaseInfo: null
+			}>
+		}
+
+		// A BARE ARRAY, not the `{ Results, TotalResults }` envelope `fromCreator` uses.
+		expect(await search('')).toEqual([])
+
+		const made: Record<string, string> = {}
+		// Six published items across three outfit types, plus one unpublished and one Coach's.
+		// Creation times ascend with the index so "newest first" is unambiguous.
+		const spec: Array<[name: string, outfitType: number, accessibility: number, creator: number]> =
+			[
+				['Hat A', 0, 1, 205],
+				['Shirt A', 2, 1, 205],
+				['Shirt B', 2, 1, 205],
+				['Trousers A', 3, 1, 205],
+				['Coach Hat', 0, 1, 1],
+				['Hidden', 0, 0, 205],
+			]
+		for (const [i, [name, outfitType, accessibility, creator]] of spec.entries()) {
+			const created = await createCustomAvatarItem(
+				env.DB,
+				{
+					customAvatarItemId: crypto.randomUUID(),
+					creatorAccountId: creator,
+					name,
+					description: '',
+					price: 0,
+					baseAvatarItemId: 1,
+					baseAvatarItemColor: '#fff',
+					accessibility,
+					designFilename: 'design_x.bin',
+					thumbnailImageFilename: 'thumb_x.png',
+				},
+				new Date(Date.UTC(2026, 7, 1 + i))
+			)
+			made[name] = created.CustomAvatarItemId
+			// Nothing sets outfit_type on creation yet, so set it straight in the table.
+			await env.DB.prepare(
+				'UPDATE custom_avatar_item SET outfit_type = ?2 WHERE custom_avatar_item_id = ?1'
+			)
+				.bind(created.CustomAvatarItemId, outfitType)
+				.run()
+		}
+
+		// Newest first, and `Hidden` never appears: Accessibility 0 is unpublished, and this is
+		// the shared browse surface — its creator sees it through `fromCreator`, not here.
+		const all = await search('')
+		expect(all.map((i) => i.Name)).toEqual([
+			'Coach Hat',
+			'Trousers A',
+			'Shirt B',
+			'Shirt A',
+			'Hat A',
+		])
+
+		// `outfitTypes` repeats and acts as a whitelist — the real client sends a dozen of them.
+		expect((await search('?outfitTypes=2')).map((i) => i.Name)).toEqual(['Shirt B', 'Shirt A'])
+		expect((await search('?outfitTypes=0&outfitTypes=3')).map((i) => i.Name)).toEqual([
+			'Coach Hat',
+			'Trousers A',
+			'Hat A',
+		])
+
+		// Sending NONE means no filter, not no results: the client sends every type it can render,
+		// so reading an absent parameter as an empty `IN ()` would empty the store.
+		expect((await search('?skip=0&take=100')).map((i) => i.Name)).toEqual(all.map((i) => i.Name))
+
+		// A non-numeric value is dropped rather than becoming NaN, which would match nothing and
+		// quietly empty a filter the caller believes they set.
+		expect((await search('?outfitTypes=2&outfitTypes=nonsense')).map((i) => i.Name)).toEqual([
+			'Shirt B',
+			'Shirt A',
+		])
+
+		// Paging, and it is STABLE: consecutive pages must not repeat or skip a row, which the
+		// id tiebreak in the ordering is what guarantees when timestamps collide.
+		const page1 = await search('?skip=0&take=2')
+		const page2 = await search('?skip=2&take=2')
+		expect(page1.map((i) => i.Name)).toEqual(['Coach Hat', 'Trousers A'])
+		expect(page2.map((i) => i.Name)).toEqual(['Shirt B', 'Shirt A'])
+		expect(
+			page1.some((i) => page2.some((j) => j.CustomAvatarItemId === i.CustomAvatarItemId))
+		).toBe(false)
+		expect(await search('?skip=99&take=10')).toEqual([])
+		expect(await search('?take=0')).toEqual([])
+
+		// The client capitalises its booleans (`includeCoachItems=True`), so the comparison folds
+		// case; only a recognisable "false" turns the stock content off.
+		expect((await search('?includeCoachItems=True')).map((i) => i.Name)).toContain('Coach Hat')
+		expect((await search('?includeCoachItems=false')).map((i) => i.Name)).not.toContain('Coach Hat')
+
+		// The whole query the client actually sends, unchanged — the parameters that aren't acted
+		// on yet must be accepted rather than 400 or throw.
+		const real = await search(
+			'?outfitTypes=0&outfitTypes=2&outfitTypes=3&outfitTypes=10&outfitTypes=20&outfitTypes=100' +
+				'&outfitTypes=101&outfitTypes=102&outfitTypes=103&outfitTypes=200&outfitTypes=300' +
+				'&outfitTypes=301&includePurchaseInfos=True&includeCoachItems=True&ordering=0&skip=0' +
+				'&take=100&unityAssetTarget=0&unityAssetVersion=3'
+		)
+		expect(real.map((i) => i.Name)).toEqual(all.map((i) => i.Name))
+		// `includePurchaseInfos=True` notwithstanding: nothing prices a custom item here yet, so
+		// the field is null on every item and the parameter changes nothing.
+		expect(real.every((i) => i.PurchaseInfo === null)).toBe(true)
+	})
+
+	test('GET /api/customAvatarItems/v1/search matches name or description, and bounds price', async () => {
+		await env.DB.prepare('DELETE FROM custom_avatar_item').run()
+
+		const search = async (query: string) => {
+			const res = await exports.default.fetch(`${ORIGIN}/api/customAvatarItems/v1/search${query}`)
+			expect(res.status, query).toBe(200)
+			return ((await res.json()) as Array<{ Name: string }>).map((i) => i.Name)
+		}
+
+		const make = async (name: string, description: string, price: number, i: number) =>
+			createCustomAvatarItem(
+				env.DB,
+				{
+					customAvatarItemId: crypto.randomUUID(),
+					creatorAccountId: 205,
+					name,
+					description,
+					price,
+					baseAvatarItemId: 1,
+					baseAvatarItemColor: '#fff',
+					accessibility: 1,
+					designFilename: 'design_x.bin',
+					thumbnailImageFilename: 'thumb_x.png',
+				},
+				new Date(Date.UTC(2026, 7, 1 + i))
+			)
+
+		await make('Room Hat', '', 100, 0)
+		// Matched on DESCRIPTION, not name — the two are searched together.
+		await make('Cosy Beanie', 'Warm in any ROOM', 500, 1)
+		// Matched case-insensitively and as a SUBSTRING, mid-word.
+		await make('Ballroom Shoes', '', 9000, 2)
+		await make('Unrelated Cap', 'nothing to do with it', 250, 3)
+		// A name holding LIKE metacharacters, for the escaping below.
+		await make('100% Wool', 'a_b', 50, 4)
+
+		// Newest first throughout, so the order also proves the query didn't disturb the ordering.
+		expect(await search('?searchQuery=room')).toEqual(['Ballroom Shoes', 'Cosy Beanie', 'Room Hat'])
+		// Case folds both ways: SQLite's own LIKE only folds ASCII, so both sides are lowered.
+		expect(await search('?searchQuery=ROOM')).toEqual(['Ballroom Shoes', 'Cosy Beanie', 'Room Hat'])
+		expect(await search('?searchQuery=beanie')).toEqual(['Cosy Beanie'])
+		expect(await search('?searchQuery=nothing%20to%20do')).toEqual(['Unrelated Cap'])
+		expect(await search('?searchQuery=zzzz')).toEqual([])
+
+		// Blank or absent is NO filter, not an empty result — a cleared search box must show the
+		// store rather than nothing.
+		expect(await search('?searchQuery=')).toHaveLength(5)
+		expect(await search('?searchQuery=%20%20')).toHaveLength(5)
+
+		// A needle of LIKE metacharacters matches them LITERALLY. Unescaped, `%` would match every
+		// item and `_` any single character, so a player searching for "100%" would get the lot.
+		expect(await search('?searchQuery=%25')).toEqual(['100% Wool'])
+		expect(await search('?searchQuery=a_b')).toEqual(['100% Wool'])
+
+		// Price bounds, inclusive at both ends.
+		expect(await search('?minPrice=250&maxPrice=9000')).toEqual([
+			'Unrelated Cap',
+			'Ballroom Shoes',
+			'Cosy Beanie',
+		])
+		expect(await search('?maxPrice=100')).toEqual(['100% Wool', 'Room Hat'])
+		expect(await search('?minPrice=9000')).toEqual(['Ballroom Shoes'])
+		expect(await search('?minPrice=100000')).toEqual([])
+
+		// Combined with the text search, since the client sends both together.
+		expect(await search('?searchQuery=room&maxPrice=500')).toEqual(['Cosy Beanie', 'Room Hat'])
+
+		// The whole query the client actually sends. `itemTypes` and the unity asset parameters are
+		// accepted and not acted on; `outfitTypes=105` matches nothing, so this is empty — which is
+		// the filter working, not the search failing.
+		expect(
+			await search(
+				'?searchQuery=room&itemTypes=-1&outfitTypes=105&minPrice=0&maxPrice=10000' +
+					'&includePurchaseInfos=True&includeCoachItems=False&ordering=0&skip=0&take=1000' +
+					'&unityAssetTarget=0&unityAssetVersion=3'
+			)
+		).toEqual([])
+		// Same query with the outfit-type filter dropped: the rest of it does match.
+		expect(
+			await search(
+				'?searchQuery=room&itemTypes=-1&minPrice=0&maxPrice=10000&includePurchaseInfos=True' +
+					'&includeCoachItems=False&ordering=0&skip=0&take=1000&unityAssetTarget=0' +
+					'&unityAssetVersion=3'
+			)
+		).toEqual(['Ballroom Shoes', 'Cosy Beanie', 'Room Hat'])
 	})
 
 	test('GET /api/customAvatarItems/v2/fromCreator/:id shows unpublished items only to the creator', async () => {
@@ -1131,29 +1359,110 @@ describe('public endpoints', () => {
 		expect(await res.json()).toEqual([])
 	})
 
-	// A BARE ARRAY of the items that matched — not the `{ Results, TotalResults }` page
-	// the sibling custom-item reads serve. Nothing stores custom items, so every id
-	// misses, and a miss is an absent entry rather than an error.
-	test('POST /api/customAvatarItems/v1/bulk returns the matching items as an array', async () => {
-		const res = await exports.default.fetch(`${ORIGIN}/api/customAvatarItems/v1/bulk`, {
+	/** Create a custom avatar item and return it, so a bulk lookup has something to find. */
+	async function createCustomItem(
+		creator: string,
+		metadata: Record<string, unknown>
+	): Promise<{ CustomAvatarItemId: string; Name: string }> {
+		const form = new FormData()
+		form.set(
+			'metadata',
+			JSON.stringify({
+				Name: 'bulk item',
+				Description: '',
+				Price: 0,
+				BaseAvatarItemId: 2184,
+				BaseAvatarItemColor: '#F55C1A',
+				Accessibility: 1,
+				...metadata,
+			})
+		)
+		form.set('thumbnailImage', new File([new Uint8Array([1])], 'f.bin', { type: 'image/png' }))
+		form.set('design', new File([new Uint8Array([2])], 'f.bin', { type: 'image/png' }))
+		const res = await exports.default.fetch(`${ORIGIN}/api/customAvatarItems/v1`, {
 			method: 'POST',
-			headers: {
-				'content-type': 'application/x-www-form-urlencoded',
-				...(await bearer()),
-			},
-			// Repeated form field, as `[FromForm] List<string>` binds it.
-			body: new URLSearchParams([
-				['customAvatarItemIds', 'a'],
-				['customAvatarItemIds', 'b'],
-			]),
+			headers: await bearer(creator),
+			body: form,
 		})
 		expect(res.status).toBe(200)
-		expect(await res.json()).toEqual([])
+		return ((await res.json()) as { Value: { CustomAvatarItemId: string; Name: string } }).Value
+	}
+
+	/** POST the bulk lookup with `ids` as repeated form fields, as the client binds them. */
+	async function bulkLookup(
+		ids: string[],
+		as = '42'
+	): Promise<Array<{ CustomAvatarItemId: string; Name: string }>> {
+		const res = await exports.default.fetch(`${ORIGIN}/api/customAvatarItems/v1/bulk`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/x-www-form-urlencoded', ...(await bearer(as)) },
+			// Repeated form field, as `[FromForm] List<string>` binds it.
+			body: new URLSearchParams(ids.map((id) => ['customAvatarItemIds', id])),
+		})
+		expect(res.status).toBe(200)
+		return (await res.json()) as Array<{ CustomAvatarItemId: string; Name: string }>
+	}
+
+	// A BARE ARRAY of the items that matched — not the `{ Results, TotalResults }` page
+	// the sibling custom-item reads serve — resolved out of the `custom_avatar_item` table.
+	// This is what a `1.<guid>` entity in a Generic discovery row resolves through, so it
+	// answering `[]` (as it did while it was a stub) renders that row's items as nothing.
+	test('POST /api/customAvatarItems/v1/bulk resolves the posted ids against the table', async () => {
+		const first = await createCustomItem('205', { Name: 'bulk one' })
+		const second = await createCustomItem('205', { Name: 'bulk two' })
+
+		// In REQUEST order, not creation order — the client reads the array positionally.
+		const items = await bulkLookup([second.CustomAvatarItemId, first.CustomAvatarItemId])
+		expect(items.map((i) => i.CustomAvatarItemId)).toEqual([
+			second.CustomAvatarItemId,
+			first.CustomAvatarItemId,
+		])
+		expect(items[0]).toMatchObject({ Name: 'bulk two', CreatorAccountId: 205, Accessibility: 1 })
+
+		// A miss is an absent entry, not an error: the client reads the items it got back
+		// rather than the ids it asked for, so an unknown id must not cost it the rest.
+		const mixed = await bulkLookup([
+			'00000000-0000-0000-0000-000000000000',
+			first.CustomAvatarItemId,
+		])
+		expect(mixed.map((i) => i.CustomAvatarItemId)).toEqual([first.CustomAvatarItemId])
+
+		// Ids also ride comma-separated inside one field, and on the query string — the
+		// client's exact encoding here isn't pinned down, so all three spellings are read.
+		const commas = await bulkLookup([`${first.CustomAvatarItemId},${second.CustomAvatarItemId}`])
+		expect(commas).toHaveLength(2)
+		const queried = await exports.default.fetch(
+			`${ORIGIN}/api/customAvatarItems/v1/bulk?customAvatarItemIds=${first.CustomAvatarItemId}`,
+			{ method: 'POST', headers: await bearer() }
+		)
+		expect(((await queried.json()) as unknown[]).length).toBe(1)
+
+		// Over 100 ids answers EMPTY without touching the table. The client has been seen posting
+		// far more than a screen could draw, and empty is safe precisely because a miss here is
+		// already not an error. Empty rather than the first 100: the client reads the items it got
+		// back, not the ids it asked about, so it cannot tell a truncated batch from a batch of
+		// misses and would cache the difference.
+		const padding = Array.from({ length: 99 }, () => '00000000-0000-0000-0000-000000000000')
+		expect(await bulkLookup([first.CustomAvatarItemId, ...padding])).toHaveLength(1)
+		expect(
+			await bulkLookup([first.CustomAvatarItemId, second.CustomAvatarItemId, ...padding])
+		).toEqual([])
 	})
 
-	// The ids are never parsed (nothing could match), so a missing body is still a 200
-	// rather than the 400 a body-reading handler would produce.
-	test('POST /api/customAvatarItems/v1/bulk ignores the body', async () => {
+	// Unpublished items are held back from everyone but their creator — the same rule the
+	// featured/hot feeds and the creator shelf apply, so this route can't surface an item
+	// the feeds hide.
+	test('POST /api/customAvatarItems/v1/bulk hides unpublished items from everyone but the creator', async () => {
+		const hidden = await createCustomItem('206', { Name: 'unpublished', Accessibility: 0 })
+
+		expect(await bulkLookup([hidden.CustomAvatarItemId], '42')).toEqual([])
+		const own = await bulkLookup([hidden.CustomAvatarItemId], '206')
+		expect(own.map((i) => i.Name)).toEqual(['unpublished'])
+	})
+
+	// A missing body is a 200 with an empty array rather than a 400: nothing was asked for,
+	// so nothing matched — the same shape as asking for ids that all miss.
+	test('POST /api/customAvatarItems/v1/bulk answers an empty array for an empty body', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/api/customAvatarItems/v1/bulk`, {
 			method: 'POST',
 			headers: await bearer(),
@@ -1503,6 +1812,557 @@ describe('public endpoints', () => {
 		expect((await one.json()) as SavedInvention).toMatchObject({ InventionId: saved.InventionId })
 	})
 
+	test('POST /api/inventions/v9/save answers the enveloped result the client reads', async () => {
+		const body = {
+			name: '082926 13:42:46',
+			description: 'No description yet',
+			imageName: 'invention/2026-08-29/52c1e282-76f5-4974-975f-d85060884085.jpg',
+			hasBetaContent: false,
+			instantiationCost: 101,
+			lightsCost: 0,
+			chipsCost: 0,
+			cloudVariablesCost: 0,
+			aiCost: 0,
+			ugcVersion: 1,
+			creationRoomId: 398,
+			inventionDataFilename: '2026-08-29/cb608051-f38b-4ef2-aa8a-a26eb0195b2b.inv',
+			referencedInventions: [],
+			referencedUnityAssetIds: [],
+			creatorAccountRole: 255,
+			convertedFromInventionId: null,
+			displayMetadataJson: '{"0":0,"99":0}',
+			longDescription: '',
+			tagsRequest: { AutoTags: ['small'], CustomTags: null },
+		}
+		const res = await exports.default.fetch(`${ORIGIN}/api/inventions/v9/save`, {
+			method: 'POST',
+			headers: { ...(await bearer('5151')), 'Content-Type': 'application/json' },
+			body: JSON.stringify(body),
+		})
+		expect(res.status).toBe(200)
+
+		// v9 is ENVELOPED where v6 is bare. The client checks Success and then reads
+		// Value.Invention.InventionId — unguarded, so a true Success with a null Value is
+		// the one shape that takes it down.
+		const result = (await res.json()) as InventionSaveV9Result
+		expect(result.Success).toBe(true)
+		expect(result.Error).toBeNull()
+		expect(result.error_id).toBeNull()
+		const value = result.Value
+		if (value === null) throw new Error('Value must not be null on a successful save')
+		expect(value.Status).toBe(0)
+		expect(Object.keys(value).sort()).toEqual([
+			'Invention',
+			'InventionVersion',
+			'Status',
+			'TagsResponse',
+		])
+
+		const saved = value.Invention
+		expect(saved.InventionId).toBeGreaterThan(0)
+		expect(saved.CreatorPlayerId).toBe(5151)
+		expect(saved.Name).toBe(body.name)
+		expect(saved.CreationRoomId).toBe(398)
+		expect(saved.DisplayMetadataJson).toBe('{"0":0,"99":0}')
+		// UgcVersion is an INVENTION field here, next to the version numbers — not a
+		// version one, where its twin HasBetaContent lives.
+		expect(saved.UgcVersion).toBe(1)
+		expect(saved.CurrentVersionNumber).toBe(1)
+		expect(saved.LatestVersionNumber).toBe(1)
+		// The v9 RRInvention has no nested version, no Referenced* and no IsPublished —
+		// the client reads publication from FirstPublishedAt.
+		expect(saved).not.toHaveProperty('CurrentVersion')
+		expect(saved).not.toHaveProperty('ReferencedInventions')
+		expect(saved).not.toHaveProperty('IsPublished')
+		expect(saved.FirstPublishedAt).toBeNull()
+
+		// Costs, the blob and the beta flag ride on the version beside it. No AICost: the
+		// request sends one and this DTO has nowhere to put it.
+		expect(value.InventionVersion).toMatchObject({
+			InventionId: saved.InventionId,
+			VersionNumber: 1,
+			InstantiationCost: 101,
+			HasBetaContent: false,
+			BlobName: body.inventionDataFilename,
+			UgcAccessibility: null,
+			ReferencedInventions: [],
+			ReferencedUnityAssetIds: [],
+		})
+		expect(value.InventionVersion).not.toHaveProperty('AICost')
+
+		// The tagsRequest is applied as `v1/settags` would have applied it, and answered
+		// the way settags answers: a result code and the bare tag NAMES.
+		expect(value.TagsResponse).toEqual({ Result: 0, Tags: ['small'] })
+		const details = await exports.default.fetch(
+			`${ORIGIN}/api/inventions/v1/details?inventionId=${saved.InventionId}`
+		)
+		expect(await details.json()).toEqual({ Tags: [{ Tag: 'small', Type: 2 }] })
+
+		// Stored once, read by every version: the older lookup still serves the record it
+		// always did, nested CurrentVersion and all.
+		const one = await exports.default.fetch(
+			`${ORIGIN}/api/inventions/v1?inventionId=${saved.InventionId}`
+		)
+		expect((await one.json()) as SavedInvention).toMatchObject({
+			InventionId: saved.InventionId,
+			IsPublished: false,
+			CurrentVersion: { BlobName: body.inventionDataFilename },
+		})
+	})
+
+	test('POST /api/inventions/v9/save leaves the v9-only keys off the stored record', async () => {
+		// The same body a v6 client sends, posted at v9: nothing is back-filled, so the
+		// record is the one v6 has always stored. The response still carries the full v9
+		// projection — those fields have defaults there, not absences.
+		const res = await exports.default.fetch(`${ORIGIN}/api/inventions/v9/save`, {
+			method: 'POST',
+			headers: { ...(await bearer('5152')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ name: 'Bare Save', inventionDataFilename: 'bare.inv' }),
+		})
+		expect(res.status).toBe(200)
+		const value = ((await res.json()) as InventionSaveV9Result).Value
+		if (value === null) throw new Error('Value must not be null on a successful save')
+		expect(value.Invention.UgcVersion).toBe(0)
+		expect(value.Invention.DisplayMetadataJson).toBeNull()
+		expect(value.InventionVersion.HasBetaContent).toBe(false)
+		expect(value.TagsResponse).toEqual({ Result: 0, Tags: [] })
+
+		const one = await exports.default.fetch(
+			`${ORIGIN}/api/inventions/v1?inventionId=${value.Invention.InventionId}`
+		)
+		const stored = (await one.json()) as SavedInvention
+		expect(stored).not.toHaveProperty('Tags')
+		expect(stored).not.toHaveProperty('UgcVersion')
+		expect(stored).not.toHaveProperty('ReferencedUnityAssetIds')
+		expect(stored.CurrentVersion).not.toHaveProperty('HasBetaContent')
+	})
+
+	test('POST /api/inventions/v9/save refuses through the envelope, never a bare error', async () => {
+		// A refusal the client can show is Success:false with a null Value — the branch
+		// that reads Error and nothing else. A bare `{ error }` body would deserialize to
+		// a null envelope and take the client down instead of failing the save.
+		const res = await exports.default.fetch(`${ORIGIN}/api/inventions/v9/save`, {
+			method: 'POST',
+			headers: { ...(await bearer('5153')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ name: 'No Blob' }),
+		})
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual({
+			Value: null,
+			Success: false,
+			Error: 'inventionDataFilename is required',
+			error_id: null,
+		})
+
+		// Even the 401 answers the envelope: an empty body is a null envelope to the
+		// client, which is the crash, not a refusal.
+		const anon = await exports.default.fetch(`${ORIGIN}/api/inventions/v9/save`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ name: 'Anon', inventionDataFilename: 'anon.inv' }),
+		})
+		expect(anon.status).toBe(401)
+		expect((await anon.json()) as InventionSaveV9Result).toMatchObject({
+			Value: null,
+			Success: false,
+		})
+	})
+
+	test('POST /api/inventions/v9/save keeps the save when a tag breaks the tag rule', async () => {
+		// The reply carries a tag result of its own, so the two outcomes are separate: a
+		// hyphen in a tag must not cost the player the build they just saved.
+		const res = await exports.default.fetch(`${ORIGIN}/api/inventions/v9/save`, {
+			method: 'POST',
+			headers: { ...(await bearer('5154')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				name: 'Tagged Badly',
+				inventionDataFilename: 'tagged-badly.inv',
+				tagsRequest: { AutoTags: ['small'], CustomTags: ['bad-tag'] },
+			}),
+		})
+		expect(res.status).toBe(200)
+		const result = (await res.json()) as InventionSaveV9Result
+		expect(result.Success).toBe(true)
+		const value = result.Value
+		if (value === null) throw new Error('a refused tag must not refuse the save')
+		expect(value.Invention.InventionId).toBeGreaterThan(0)
+
+		// Non-zero result, and the whole list dropped rather than the offending tag alone —
+		// the creator re-submits it through `v1/settags` and sees what took.
+		expect(value.TagsResponse).toEqual({ Result: 1, Tags: [] })
+		const details = await exports.default.fetch(
+			`${ORIGIN}/api/inventions/v1/details?inventionId=${value.Invention.InventionId}`
+		)
+		expect(await details.json()).toEqual({ Tags: [] })
+
+		// The invention is on the creator's shelf regardless.
+		const mine = await exports.default.fetch(`${ORIGIN}/api/inventions/v2/mine`, {
+			headers: await bearer('5154'),
+		})
+		expect(((await mine.json()) as SavedInvention[]).map((i) => i.InventionId)).toEqual([
+			value.Invention.InventionId,
+		])
+	})
+
+	test('PUT /api/inventions/v2/metadata edits only the fields that aren’t null', async () => {
+		const save = await exports.default.fetch(`${ORIGIN}/api/inventions/v9/save`, {
+			method: 'POST',
+			headers: { ...(await bearer('5160')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				name: 'Before Edit',
+				description: 'the original description',
+				imageName: 'invention/before.jpg',
+				inventionDataFilename: 'before-edit.inv',
+				longDescription: 'the original blurb',
+				tagsRequest: { AutoTags: ['small'], CustomTags: null },
+			}),
+		})
+		const inventionId = ((await save.json()) as InventionSaveV9Result).Value?.Invention.InventionId
+		expect(inventionId).toBeGreaterThan(0)
+
+		// The client sends the whole shape every time and marks what it isn't touching as
+		// null — so a null Name must not blank the name.
+		const res = await exports.default.fetch(`${ORIGIN}/api/inventions/v2/metadata`, {
+			method: 'PUT',
+			headers: { ...(await bearer('5160')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				InventionId: inventionId,
+				Name: null,
+				Description: 'devin test No description yet',
+				LongDescription: null,
+				ImageName: null,
+				TagsRequest: null,
+			}),
+		})
+		expect(res.status).toBe(200)
+		const result = (await res.json()) as InventionSaveV9Result
+		expect(result.Success).toBe(true)
+		const value = result.Value
+		if (value === null) throw new Error('Value must not be null on a successful edit')
+
+		// The edit answers the UPDATED invention — the client re-renders the detail page
+		// from it — in the same envelope the save answers.
+		expect(value.Invention.Description).toBe('devin test No description yet')
+		expect(value.Invention.Name).toBe('Before Edit')
+		expect(value.Invention.ImageName).toBe('invention/before.jpg')
+		expect(value.Invention.InventionId).toBe(inventionId)
+		// A null TagsRequest leaves the stored tags alone, and they are still reported: the
+		// list is what the invention HAS, not what this call changed.
+		expect(value.TagsResponse).toEqual({ Result: 0, Tags: ['small'] })
+
+		// And it stuck — including the long description, which the v9 Invention DTO has no
+		// key for but the record keeps.
+		const one = await exports.default.fetch(
+			`${ORIGIN}/api/inventions/v1?inventionId=${inventionId}`
+		)
+		expect((await one.json()) as SavedInvention).toMatchObject({
+			Name: 'Before Edit',
+			Description: 'devin test No description yet',
+			LongDescription: 'the original blurb',
+			Tags: [{ Tag: 'small', Type: 2 }],
+		})
+	})
+
+	test('PUT /api/inventions/v2/metadata treats an empty string as a clear, not a null', async () => {
+		const save = await exports.default.fetch(`${ORIGIN}/api/inventions/v9/save`, {
+			method: 'POST',
+			headers: { ...(await bearer('5161')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				name: 'Clear Me',
+				description: 'to be cleared',
+				imageName: 'invention/clear-me.jpg',
+				inventionDataFilename: 'clear-me.inv',
+				longDescription: 'blurb to be cleared',
+			}),
+		})
+		const inventionId = ((await save.json()) as InventionSaveV9Result).Value?.Invention.InventionId
+
+		const res = await exports.default.fetch(`${ORIGIN}/api/inventions/v2/metadata`, {
+			method: 'PUT',
+			headers: { ...(await bearer('5161')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				InventionId: inventionId,
+				Name: null,
+				Description: '',
+				LongDescription: '',
+				ImageName: '',
+				TagsRequest: { AutoTags: ['large'], CustomTags: ['puzzle'] },
+			}),
+		})
+		const value = ((await res.json()) as InventionSaveV9Result).Value
+		if (value === null) throw new Error('Value must not be null on a successful edit')
+		expect(value.Invention.Description).toBe('')
+		expect(value.Invention.ImageName).toBe('')
+		// TagsRequest replaces both lists wholesale, auto first, then custom.
+		expect(value.TagsResponse).toEqual({ Result: 0, Tags: ['large', 'puzzle'] })
+
+		// An empty name is not how a name is cleared — nothing can draw a nameless
+		// invention, so it fails the same rule a save holds it to and nothing is written.
+		const named = await exports.default.fetch(`${ORIGIN}/api/inventions/v2/metadata`, {
+			method: 'PUT',
+			headers: { ...(await bearer('5161')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ InventionId: inventionId, Name: '' }),
+		})
+		expect(named.status).toBe(200)
+		expect((await named.json()) as InventionSaveV9Result).toMatchObject({
+			Value: null,
+			Success: false,
+		})
+		const one = await exports.default.fetch(
+			`${ORIGIN}/api/inventions/v1?inventionId=${inventionId}`
+		)
+		expect(((await one.json()) as SavedInvention).Name).toBe('Clear Me')
+	})
+
+	test('PUT /api/inventions/v2/metadata refuses another creator’s invention in-band', async () => {
+		const save = await exports.default.fetch(`${ORIGIN}/api/inventions/v9/save`, {
+			method: 'POST',
+			headers: { ...(await bearer('5162')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ name: 'Not Yours', inventionDataFilename: 'not-yours.inv' }),
+		})
+		const inventionId = ((await save.json()) as InventionSaveV9Result).Value?.Invention.InventionId
+
+		// Someone else's invention and an unknown one are domain answers, not transport
+		// ones — the client's own status enum has NotCreator and DoesNotExist members — so
+		// they come back 200 in the envelope, where the message reaches a human.
+		const theirs = await exports.default.fetch(`${ORIGIN}/api/inventions/v2/metadata`, {
+			method: 'PUT',
+			headers: { ...(await bearer('5163')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ InventionId: inventionId, Description: 'hijacked' }),
+		})
+		expect(theirs.status).toBe(200)
+		expect(await theirs.json()).toEqual({
+			Value: null,
+			Success: false,
+			Error: 'Not your invention',
+			error_id: null,
+		})
+
+		const missing = await exports.default.fetch(`${ORIGIN}/api/inventions/v2/metadata`, {
+			method: 'PUT',
+			headers: { ...(await bearer('5162')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ InventionId: 987654, Description: 'nobody' }),
+		})
+		expect(missing.status).toBe(200)
+		expect((await missing.json()) as InventionSaveV9Result).toMatchObject({
+			Value: null,
+			Error: 'No such invention',
+		})
+
+		// A missing token is the one refusal that stays a transport failure — but it still
+		// answers the envelope, because an unparseable body crashes the client.
+		const anon = await exports.default.fetch(`${ORIGIN}/api/inventions/v2/metadata`, {
+			method: 'PUT',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ InventionId: inventionId, Description: 'anon' }),
+		})
+		expect(anon.status).toBe(401)
+		expect((await anon.json()) as InventionSaveV9Result).toMatchObject({
+			Value: null,
+			Success: false,
+		})
+
+		// Untouched throughout.
+		const one = await exports.default.fetch(
+			`${ORIGIN}/api/inventions/v1?inventionId=${inventionId}`
+		)
+		expect(((await one.json()) as SavedInvention).Description).toBe('No description yet')
+	})
+
+	test('PUT /api/inventions/v2/metadata keeps the edit when a tag breaks the tag rule', async () => {
+		const save = await exports.default.fetch(`${ORIGIN}/api/inventions/v9/save`, {
+			method: 'POST',
+			headers: { ...(await bearer('5164')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				name: 'Tag Trouble',
+				inventionDataFilename: 'tag-trouble.inv',
+				tagsRequest: { AutoTags: ['small'], CustomTags: null },
+			}),
+		})
+		const inventionId = ((await save.json()) as InventionSaveV9Result).Value?.Invention.InventionId
+
+		const res = await exports.default.fetch(`${ORIGIN}/api/inventions/v2/metadata`, {
+			method: 'PUT',
+			headers: { ...(await bearer('5164')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				InventionId: inventionId,
+				Description: 'edited anyway',
+				TagsRequest: { AutoTags: ['small'], CustomTags: ['bad-tag'] },
+			}),
+		})
+		const value = ((await res.json()) as InventionSaveV9Result).Value
+		if (value === null) throw new Error('a refused tag must not refuse the edit')
+		// The metadata edit lands; the tags are what didn't.
+		expect(value.Invention.Description).toBe('edited anyway')
+		expect(value.TagsResponse).toEqual({ Result: 1, Tags: [] })
+		const details = await exports.default.fetch(
+			`${ORIGIN}/api/inventions/v1/details?inventionId=${inventionId}`
+		)
+		expect(await details.json()).toEqual({ Tags: [] })
+	})
+
+	test('POST /api/inventions/v4/publish publishes with the permission and accessibility sent', async () => {
+		const save = await exports.default.fetch(`${ORIGIN}/api/inventions/v9/save`, {
+			method: 'POST',
+			headers: { ...(await bearer('5170')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ name: 'Publish Me', inventionDataFilename: 'publish-me.inv' }),
+		})
+		const saved = ((await save.json()) as InventionSaveV9Result).Value?.Invention
+		expect(saved?.FirstPublishedAt).toBeNull()
+
+		const res = await exports.default.fetch(`${ORIGIN}/api/inventions/v4/publish`, {
+			method: 'POST',
+			headers: { ...(await bearer('5170')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				InventionId: saved?.InventionId,
+				Permission: 20,
+				Accessibility: 1,
+				Price: null,
+			}),
+		})
+		expect(res.status).toBe(200)
+		const result = (await res.json()) as InventionSaveV9Result
+		expect(result.Success).toBe(true)
+		const value = result.Value
+		if (value === null) throw new Error('Value must not be null on a successful publish')
+
+		// Publishing narrows what everyone else gets down to what the sheet sent, and dates
+		// the invention — the client reads publication from FirstPublishedAt, not a flag.
+		expect(value.Invention.GeneralPermission).toBe(20)
+		expect(value.Invention.Accessibility).toBe(1)
+		expect(typeof value.Invention.FirstPublishedAt).toBe('string')
+		expect(value.Invention.Price).toBe(0)
+
+		// And it's findable now: the record the older reads serve says published, and it
+		// turns up in search.
+		const one = await exports.default.fetch(
+			`${ORIGIN}/api/inventions/v1?inventionId=${value.Invention.InventionId}`
+		)
+		expect((await one.json()) as SavedInvention).toMatchObject({ IsPublished: true })
+		const found = await exports.default.fetch(`${ORIGIN}/api/inventions/v2/search?value=Publish Me`)
+		expect(((await found.json()) as SavedInvention[]).map((i) => i.InventionId)).toContain(
+			value.Invention.InventionId
+		)
+
+		// Taken back out: the browse tests below assert the exact published catalogue, and
+		// a test that publishes something publicly is a test that changes it.
+		await env.DB.prepare('DELETE FROM invention WHERE id = ?1')
+			.bind(value.Invention.InventionId)
+			.run()
+	})
+
+	test('POST /api/inventions/v4/publish keeps an unlisted invention out of the feeds', async () => {
+		const save = await exports.default.fetch(`${ORIGIN}/api/inventions/v9/save`, {
+			method: 'POST',
+			headers: { ...(await bearer('5171')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				name: 'Quietly Published',
+				inventionDataFilename: 'quietly-published.inv',
+				creationRoomId: 4171,
+			}),
+		})
+		const inventionId = ((await save.json()) as InventionSaveV9Result).Value?.Invention.InventionId
+
+		const res = await exports.default.fetch(`${ORIGIN}/api/inventions/v4/publish`, {
+			method: 'POST',
+			headers: { ...(await bearer('5171')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ InventionId: inventionId, Permission: 20, Accessibility: 2 }),
+		})
+		const value = ((await res.json()) as InventionSaveV9Result).Value
+		expect(value?.Invention.Accessibility).toBe(2)
+
+		// Unlisted is published — it is reachable by id, which is the whole point of it —
+		// but it is not something anyone comes across.
+		const one = await exports.default.fetch(
+			`${ORIGIN}/api/inventions/v1?inventionId=${inventionId}`
+		)
+		expect((await one.json()) as SavedInvention).toMatchObject({
+			InventionId: inventionId,
+			IsPublished: true,
+		})
+		const found = await exports.default.fetch(
+			`${ORIGIN}/api/inventions/v2/search?value=Quietly Published`
+		)
+		expect(await found.json()).toEqual([])
+		const room = await exports.default.fetch(`${ORIGIN}/api/inventions/v1/room?id=4171`)
+		expect(await room.json()).toEqual([])
+	})
+
+	test('POST /api/inventions/v4/publish leaves a price and a first-publish date alone', async () => {
+		const save = await exports.default.fetch(`${ORIGIN}/api/inventions/v9/save`, {
+			method: 'POST',
+			headers: { ...(await bearer('5172')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ name: 'For Sale', inventionDataFilename: 'for-sale.inv' }),
+		})
+		const inventionId = ((await save.json()) as InventionSaveV9Result).Value?.Invention.InventionId
+
+		const publish = async (body: Record<string, unknown>) => {
+			const res = await exports.default.fetch(`${ORIGIN}/api/inventions/v4/publish`, {
+				method: 'POST',
+				headers: { ...(await bearer('5172')), 'Content-Type': 'application/json' },
+				body: JSON.stringify({ InventionId: inventionId, ...body }),
+			})
+			const value = ((await res.json()) as InventionSaveV9Result).Value
+			if (value === null) throw new Error('Value must not be null on a successful publish')
+			return value.Invention
+		}
+
+		const first = await publish({ Permission: 80, Accessibility: 1, Price: 250 })
+		expect(first.Price).toBe(250)
+
+		// A republish that says nothing about money must not give away something that was
+		// for sale, and must not re-date the first publish.
+		const again = await publish({ Permission: 20, Accessibility: 1, Price: null })
+		expect(again.Price).toBe(250)
+		expect(again.GeneralPermission).toBe(20)
+		expect(again.FirstPublishedAt).toBe(first.FirstPublishedAt)
+
+		// A negative price is dropped rather than stored.
+		expect((await publish({ Price: -5 })).Price).toBe(250)
+
+		// Out of the published catalogue again — see the note in the publish test above.
+		await env.DB.prepare('DELETE FROM invention WHERE id = ?1').bind(inventionId).run()
+	})
+
+	test('POST /api/inventions/v4/publish refuses another creator’s invention in-band', async () => {
+		const save = await exports.default.fetch(`${ORIGIN}/api/inventions/v9/save`, {
+			method: 'POST',
+			headers: { ...(await bearer('5173')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ name: 'Theirs Alone', inventionDataFilename: 'theirs-alone.inv' }),
+		})
+		const inventionId = ((await save.json()) as InventionSaveV9Result).Value?.Invention.InventionId
+
+		const theirs = await exports.default.fetch(`${ORIGIN}/api/inventions/v4/publish`, {
+			method: 'POST',
+			headers: { ...(await bearer('5174')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ InventionId: inventionId, Permission: 20, Accessibility: 1 }),
+		})
+		expect(theirs.status).toBe(200)
+		expect(await theirs.json()).toEqual({
+			Value: null,
+			Success: false,
+			Error: 'Not your invention',
+			error_id: null,
+		})
+
+		const anon = await exports.default.fetch(`${ORIGIN}/api/inventions/v4/publish`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ InventionId: inventionId, Permission: 20, Accessibility: 1 }),
+		})
+		expect(anon.status).toBe(401)
+		expect((await anon.json()) as InventionSaveV9Result).toMatchObject({ Value: null })
+
+		// Still unpublished throughout.
+		const one = await exports.default.fetch(
+			`${ORIGIN}/api/inventions/v1?inventionId=${inventionId}`
+		)
+		expect((await one.json()) as SavedInvention).toMatchObject({
+			IsPublished: false,
+			FirstPublishedAt: null,
+		})
+	})
+
 	test('GET /api/inventions/v2/mine lists bought inventions alongside the caller’s own', async () => {
 		// Account 6100 creates one; 6101 buys it (the econ worker's buyInvention writes
 		// exactly this row) and also creates one of their own.
@@ -1544,6 +2404,148 @@ describe('public endpoints', () => {
 			own.InventionId,
 			bought.InventionId,
 		])
+	})
+
+	test('POST /api/customAvatarItems/v1/:id/report files a report against the item’s creator', async () => {
+		// 205 makes an item; 42 reports it. The creator is derived FROM the item — the client
+		// sends `ReportedPlayerId: null` because it does not know who made it.
+		const item = await createCustomItem('205', { Name: 'Reportable Hat' })
+
+		const res = await exports.default.fetch(
+			`${ORIGIN}/api/customAvatarItems/v1/${item.CustomAvatarItemId}/report`,
+			{
+				method: 'POST',
+				headers: { ...(await bearer('42')), 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					ReportCategory: 2,
+					Details: 'tesfsfsdf',
+					ReportedPlayerId: null,
+				}),
+			}
+		)
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual({ success: true, error: '' })
+
+		// One row in the shared report table, marked as an item report by `custom_avatar_item_id`.
+		// `room_id` stays null — an item isn't tied to one room the way an event is — and the
+		// other two id columns stay null, which is what tells the kinds apart.
+		const row = await env.DB.prepare('SELECT * FROM report WHERE custom_avatar_item_id = ?1')
+			.bind(item.CustomAvatarItemId)
+			.first<Record<string, unknown>>()
+		expect(row).toMatchObject({
+			reporter_player_id: 42,
+			reported_player_id: 205, // the item's creator
+			report_category: 2,
+			details: 'tesfsfsdf',
+			custom_avatar_item_id: item.CustomAvatarItemId,
+			invention_id: null,
+			event_id: null,
+			room_id: null,
+			banned: 0, // filed unbanned, like any report
+		})
+
+		// A body naming SOMEONE ELSE is ignored: the reported player is read off the item either
+		// way. Letting a client name who a report is against would let it point one at anybody.
+		await exports.default.fetch(
+			`${ORIGIN}/api/customAvatarItems/v1/${item.CustomAvatarItemId}/report`,
+			{
+				method: 'POST',
+				headers: { ...(await bearer('42')), 'Content-Type': 'application/json' },
+				body: JSON.stringify({ ReportCategory: 1, ReportedPlayerId: 999 }),
+			}
+		)
+		const reported = await env.DB.prepare(
+			'SELECT reported_player_id FROM report WHERE custom_avatar_item_id = ?1'
+		)
+			.bind(item.CustomAvatarItemId)
+			.all<{ reported_player_id: number }>()
+		// Nothing dedupes: two reports of the same item are two rows, both against the creator.
+		expect(reported.results.map((r) => r.reported_player_id)).toEqual([205, 205])
+
+		// An item that does not exist is refused rather than filed against nobody — the row's
+		// reported player has to be someone.
+		const unknown = await exports.default.fetch(
+			`${ORIGIN}/api/customAvatarItems/v1/00000000-0000-0000-0000-000000000000/report`,
+			{
+				method: 'POST',
+				headers: { ...(await bearer('42')), 'Content-Type': 'application/json' },
+				body: JSON.stringify({ ReportCategory: 0 }),
+			}
+		)
+		expect(unknown.status).toBe(404)
+		expect(await unknown.json()).toEqual({ success: false, error: 'No such item' })
+
+		// Auth-gated: the reporter comes from the token, so there is no filing one signed out.
+		const anon = await exports.default.fetch(
+			`${ORIGIN}/api/customAvatarItems/v1/${item.CustomAvatarItemId}/report`,
+			{
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ ReportCategory: 0 }),
+			}
+		)
+		expect(anon.status).toBe(401)
+	})
+
+	test('POST /api/inventions/v1/report files a report row against the invention', async () => {
+		// 5150 saves an invention; 42 reports it. The creator is derived from the invention,
+		// so the reporter never gets to name who the report is against.
+		const save = await exports.default.fetch(`${ORIGIN}/api/inventions/v6/save`, {
+			method: 'POST',
+			headers: { ...(await bearer('5150')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ name: 'Reportable', inventionDataFilename: 'blob' }),
+		})
+		const inventionId = ((await save.json()) as InventionSaveResult).Invention.InventionId
+
+		const res = await exports.default.fetch(`${ORIGIN}/api/inventions/v1/report`, {
+			method: 'POST',
+			headers: { ...(await bearer('42')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ InventionId: inventionId, Details: 'test', ReportCategory: 0 }),
+		})
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual({ success: true, error: '' })
+
+		// One row in the shared report table, marked as an invention report by `invention_id`,
+		// with the reported player filled in FROM the invention. `room_id` stays null: an
+		// invention isn't tied to one room the way an event is, so there is nothing to read.
+		const row = await env.DB.prepare('SELECT * FROM report WHERE invention_id = ?1')
+			.bind(inventionId)
+			.first<Record<string, unknown>>()
+		expect(row).toMatchObject({
+			reporter_player_id: 42,
+			reported_player_id: 5150, // the invention's creator
+			report_category: 0,
+			details: 'test',
+			invention_id: inventionId,
+			event_id: null, // the two id columns are mutually exclusive
+			room_id: null,
+			banned: 0, // filed unbanned, like any report
+		})
+
+		// A body with no usable invention id, and one naming an invention that doesn't exist —
+		// both answer the same envelope shape as the success branch.
+		const noId = await exports.default.fetch(`${ORIGIN}/api/inventions/v1/report`, {
+			method: 'POST',
+			headers: { ...(await bearer('42')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ Details: 'x' }),
+		})
+		expect(noId.status).toBe(400)
+		expect(await noId.json()).toEqual({ success: false, error: 'InventionId is required' })
+
+		const unknown = await exports.default.fetch(`${ORIGIN}/api/inventions/v1/report`, {
+			method: 'POST',
+			headers: { ...(await bearer('42')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ InventionId: 999999 }),
+		})
+		expect(unknown.status).toBe(404)
+		expect(await unknown.json()).toEqual({ success: false, error: 'No such invention' })
+
+		// Auth-gated: the reporter comes from the token, so there's no filing one signed out.
+		const anon = await exports.default.fetch(`${ORIGIN}/api/inventions/v1/report`, {
+			method: 'POST',
+			body: JSON.stringify({ InventionId: inventionId }),
+		})
+		expect(anon.status).toBe(401)
 	})
 
 	test('POST /api/inventions/v6/save 401s without a bearer token', async () => {
@@ -1798,6 +2800,82 @@ describe('public endpoints', () => {
 		expect(await miss.json()).toEqual([])
 	})
 
+	test('GET /api/inventions/v2/search filters and pages in SQL, and does not search tags', async () => {
+		const published = (id: number, name: string, description: string, tags: string[]) =>
+			({
+				InventionId: id,
+				ReplicationId: crypto.randomUUID(),
+				CreatorPlayerId: 8081,
+				Name: name,
+				Description: description,
+				ImageName: '',
+				CurrentVersionNumber: 1,
+				CurrentVersion: { InventionId: id, VersionNumber: 1, BlobName: '' },
+				IsPublished: true,
+				HideFromPlayer: false,
+				CreatedAt: `2026-09-0${id - 200}T00:00:00Z`,
+				Tags: tags.map((Tag) => ({ Tag, Type: 2 })),
+			}) as unknown as SavedInvention
+
+		for (const inv of [
+			published(201, 'Devin Cube', 'i dont even know lol', ['small']),
+			published(202, 'Devin Cube 2', 'No description yet', ['small', 'dormanchor']),
+			published(203, 'Recflarian Flag', 'idk..... lol', ['medium']),
+			published(204, 'Smallest Table', 'a small table', ['medium']),
+			// Name holds LIKE metacharacters, for the escaping below.
+			published(205, '100% Cube_Thing', '', []),
+		]) {
+			await env.DB.prepare('INSERT INTO invention (data) VALUES (?1)')
+				.bind(JSON.stringify(inv))
+				.run()
+		}
+
+		const ids = async (query: string) => {
+			const res = await exports.default.fetch(`${ORIGIN}/api/inventions/v2/search?${query}`)
+			expect(res.status, query).toBe(200)
+			return ((await res.json()) as SavedInvention[])
+				.map((i) => i.InventionId)
+				.filter((id) => id >= 201)
+		}
+
+		// Newest first, matched against name OR description, case-insensitively.
+		expect(await ids('value=cube&skip=0&take=100')).toEqual([205, 202, 201])
+		expect(await ids('value=CUBE&skip=0&take=100')).toEqual([205, 202, 201])
+		expect(await ids('value=small&skip=0&take=100')).toEqual([204])
+		expect(await ids('value=lol&skip=0&take=100')).toEqual([203, 201])
+
+		// Terms are ANDed, so more words narrow rather than widen.
+		expect(await ids(`value=${encodeURIComponent('devin cube')}&skip=0&take=100`)).toEqual([
+			202, 201,
+		])
+		expect(await ids(`value=${encodeURIComponent('devin flag')}&skip=0&take=100`)).toEqual([])
+
+		// LIKE metacharacters are escaped: unescaped, `%` would match everything and `_` any
+		// single character, so searching for "100%" would return the whole catalogue.
+		expect(await ids('value=%25&skip=0&take=100')).toEqual([205])
+		expect(await ids('value=cube_thing&skip=0&take=100')).toEqual([205])
+
+		// TAGS ARE NOT SEARCHED. The browse screen's chips send `#small`, and no name or
+		// description contains it, so the term matches nothing — the tag is on 201 and 202, and a
+		// tag search would have returned them. Deliberate for now: matching tags needs them out of
+		// the JSON blob and into something indexable, and doing it in memory would mean reading
+		// every row to answer one page.
+		expect(await ids(`value=${encodeURIComponent('#small')}&skip=0&take=100`)).toEqual([])
+
+		// Paged in SQL: consecutive pages neither repeat nor skip a row. The `id` tiebreak in the
+		// ordering is what guarantees that when two inventions share a `CreatedAt`.
+		const page1 = await ids('value=cube&skip=0&take=2')
+		const page2 = await ids('value=cube&skip=2&take=2')
+		expect(page1).toEqual([205, 202])
+		expect(page2).toEqual([201])
+		expect(page1.some((id) => page2.includes(id))).toBe(false)
+		expect(await ids('value=cube&skip=99&take=10')).toEqual([])
+
+		// Cleaned up: the feeds and the tag-filter chips are derived from EVERY published
+		// invention, so rows left behind here would change what those tests see.
+		await env.DB.prepare('DELETE FROM invention WHERE id >= 201 AND id <= 205').run()
+	})
+
 	test('GET /api/inventions/v1/tagfilters ranks the tags in use', async () => {
 		// Two published inventions tagged `furniture`, one `bed` — plus a tagged draft,
 		// whose tags must not leak into the public filter chips.
@@ -2010,7 +3088,27 @@ describe('public endpoints', () => {
 			InstantiationCost: 42,
 		})
 
-		// Only the current version exists; anything else 404s, as does an unknown id.
+		// `version=0` means "whichever is current" rather than a number to match, and gets the
+		// same version 1 back. Nothing has a version 0 — a fresh save is version 1 — so a caller
+		// sending it does not know which version it wants, and matching it literally would 404 an
+		// invention that exists.
+		const v0 = await exports.default.fetch(
+			`${ORIGIN}/api/inventions/v1/version?inventionId=${Invention.InventionId}&version=0`
+		)
+		expect(v0.status).toBe(200)
+		expect(await v0.json()).toMatchObject({
+			InventionId: Invention.InventionId,
+			VersionNumber: 1,
+			BlobName: '2026-07-12/lamp.inv',
+		})
+
+		// The 0 shortcut does NOT make up an invention: an unknown id still 404s at 0.
+		const zeroUnknown = await exports.default.fetch(
+			`${ORIGIN}/api/inventions/v1/version?inventionId=999999&version=0`
+		)
+		expect(zeroUnknown.status).toBe(404)
+
+		// Only the current version exists; any other NUMBER still 404s, as does an unknown id.
 		const v2 = await exports.default.fetch(
 			`${ORIGIN}/api/inventions/v1/version?inventionId=${Invention.InventionId}&version=2`
 		)
@@ -5845,6 +6943,7 @@ describe('openapi', () => {
 			'DELETE /api/customAvatarItems/v1/{id}',
 			'DELETE /api/images/v1/deletesaved',
 			'DELETE /api/playerevents/v2/delete/{eventId}',
+			'GET /api/CircuitChipLists/{list}',
 			'GET /api/PlayerReporting/v1/moderationBlockDetails',
 			'GET /api/PlayerReporting/v1/voteToKickReasons',
 			'GET /api/activities/charades/v1/words/{activity}',
@@ -5861,6 +6960,7 @@ describe('openapi', () => {
 			'GET /api/customAvatarItems/v1/isCreationEnabled',
 			'GET /api/customAvatarItems/v1/isRenderingEnabled',
 			'GET /api/customAvatarItems/v1/minPriceForPublicItem',
+			'GET /api/customAvatarItems/v1/search',
 			'GET /api/customAvatarItems/v2/fromCreator/{accountId}',
 			'GET /api/equipment/v2/getUnlocked',
 			'GET /api/gameconfigs/v1/all',
@@ -5947,14 +7047,18 @@ describe('openapi', () => {
 			'POST /api/customAvatarItems/GetCustomAvatarItemCurrentSavesForLegacyAvatarItems',
 			'POST /api/customAvatarItems/v1',
 			'POST /api/customAvatarItems/v1/bulk',
+			'POST /api/customAvatarItems/v1/{id}/report',
 			'POST /api/gamesight/event',
 			'POST /api/images/v1/cheer',
 			'POST /api/images/v4/uploadsaved',
 			'POST /api/images/v5/cheered/bulk',
+			'POST /api/inventions/v1/report',
 			'POST /api/inventions/v1/settags',
 			'POST /api/inventions/v1/update',
 			'POST /api/inventions/v1/updateprice',
+			'POST /api/inventions/v4/publish',
 			'POST /api/inventions/v6/save',
+			'POST /api/inventions/v9/save',
 			'POST /api/messages/v1/friendOnlineStatus',
 			'POST /api/messages/v1/sendMultiple',
 			'POST /api/messages/v2/send',
@@ -5987,6 +7091,7 @@ describe('openapi', () => {
 			'POST /outfits/bulk',
 			'POST /statsigUserProperties',
 			'PUT /api/customAvatarItems/v1/{id}',
+			'PUT /api/inventions/v2/metadata',
 			'PUT /api/playerevents/v2/{eventId}/accessibility',
 			'PUT /api/playerevents/v2/{eventId}/description',
 			'PUT /api/playerevents/v2/{eventId}/name',

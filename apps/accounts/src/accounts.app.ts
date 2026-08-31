@@ -617,7 +617,7 @@ const app = new Hono<App>()
 		async (c) => {
 			const id = await authedId(c)
 			if (id === null) return unauthorized(c)
-			return c.json({ accountId: id, disallowInAppPurchases: false })
+			return c.json({ accountId: id, disallowInAppPurchases: true })
 		}
 	)
 

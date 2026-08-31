@@ -429,6 +429,66 @@ export const UgcPurchasableItemDto = z.object({
 /** What the bulk lookup answers: the resolved items, unknown ids omitted. */
 export const UgcPurchasableItemList = z.array(UgcPurchasableItemDto)
 
+/**
+ * `POST /api/items/purchaseInfos` JSON body — the same `{ itemType, itemId }` reference
+ * shape the UGC bulk lookup takes, minus the room. camelCase INSIDE the reference, which is
+ * the client's own inconsistency: the response wraps this very object under a PascalCase
+ * `ItemId` key without renaming its members.
+ */
+export const ItemPurchaseInfosRequest = z.object({
+	Ids: z.array(
+		z.object({
+			itemType: z.number().int().describe('3 = custom avatar item (the only type served)'),
+			itemId: z.string().describe('The `CustomAvatarItemId`'),
+		})
+	),
+})
+
+/** One `Prices[]` entry: what the item costs in one currency, and any sale on top. */
+export const ItemPriceDto = z.object({
+	CurrencyType: z.number().int().describe('2 = RecCenterTokens — what UGC items are priced in'),
+	Price: z.number().int(),
+	StorefrontSaleData: z
+		.object({
+			SalePercent: z.number().int(),
+			SaleStartDate: z.string().nullable(),
+			SaleEndDate: z.string().nullable(),
+		})
+		.nullable()
+		.describe('Always a zero-percent sale here; nothing discounts UGC items yet'),
+})
+
+/** The client's `ItemPurchaseInfo` — how one item may be bought. */
+export const ItemPurchaseInfoDto = z.object({
+	ItemId: z.object({ itemType: z.number().int(), itemId: z.string() }),
+	PurchaseMethodId: z.object({
+		Type: z.number().int(),
+		NumberId: z.number().int().nullable(),
+		Guid: z.string().nullable(),
+	}),
+	Prices: z.array(ItemPriceDto),
+	NewUntil: z.string().nullable(),
+	AvailableAt: z.string().nullable(),
+	AvailableUntil: z.string().nullable(),
+	CanBeGifted: z.boolean(),
+	CanApplySubscriberDiscount: z.boolean(),
+	SubscribersOnly: z.boolean(),
+	IsFeatured: z.boolean(),
+})
+
+/** What the purchase-info lookup answers: one entry per RESOLVED id, unknown ids omitted. */
+export const ItemPurchaseInfoList = z.array(ItemPurchaseInfoDto)
+
+/**
+ * `POST /api/avatar/v1/lockeditems/bulk` JSON body — the descs the client wants the locked
+ * state for. Currently accepted and not read; see the route.
+ */
+export const LockedItemsBulkRequest = z.object({
+	AvatarItemDescriptions: z
+		.array(z.string())
+		.describe('The `AvatarItemDesc` of each item the client is about to draw'),
+})
+
 export const ErrorResponse = z.object({ error: z.string() })
 
 // ---- Request schemas -------------------------------------------------------
@@ -532,7 +592,9 @@ export const GameRewardRequest = z.object({
 	giftContext: z
 		.string()
 		.optional()
-		.describe('The activity it came from, e.g. `Soccer` — part of the cooldown key'),
+		.describe(
+			'The activity it came from, e.g. `Soccer` — part of the cooldown key. A key of `quest-rewards.json` (`Dodgeball`, `Quest_Goblin_S`, …) also picks the prize from that activity’s table'
+		),
 })
 
 /**

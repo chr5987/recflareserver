@@ -61,6 +61,31 @@ const SELECT_COLUMNS = `room_invite_id, from_player_id, to_player_id, room_id`
 const nowSeconds = () => Math.floor(Date.now() / 1000)
 
 /**
+ * One invite by its id, or null when there is no such row.
+ *
+ * Null covers BOTH "never existed" and "already expired" — the sweep deletes expired rows
+ * rather than flagging them, and {@link ROOM_INVITE_SCHEMA_DDL} keeps ids from being
+ * reused, so a lookup that misses is an invite that is no longer good either way.
+ */
+export async function getRoomInvite(
+	db: D1Database,
+	roomInviteId: number
+): Promise<RoomInvite | null> {
+	const row = await db
+		.prepare(`SELECT ${SELECT_COLUMNS} FROM room_invite WHERE room_invite_id = ?1`)
+		.bind(roomInviteId)
+		.first<RoomInviteRow>()
+
+	if (!row) return null
+	return {
+		RoomInviteId: row.room_invite_id,
+		FromPlayerId: row.from_player_id,
+		ToPlayerId: row.to_player_id,
+		RoomId: row.room_id,
+	}
+}
+
+/**
  * Record an invite from `fromPlayerId` to `toPlayerId` for a room, returning it as the
  * client reads it back. `roomId` is null when the caller's room instance didn't resolve.
  *

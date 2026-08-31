@@ -1,10 +1,11 @@
 import * as readline from 'node:readline'
-
 import { Command } from '@commander-js/extra-typings'
 import Table from 'cli-table3'
 
-import { getRepoRoot } from '../path'
+import { execSql, resolveRemote, sqlStr, target } from '../d1'
 import { hashPassword } from '../password'
+
+import type { D1ExecResult } from '../d1'
 
 /**
  * Operator-facing admin tools for the shared `recflare` D1 database. Each command
@@ -18,18 +19,6 @@ import { hashPassword } from '../password'
  *   runx admin lookup          --username alice [--remote]
  *   runx admin grant-developer --account 1 [--revoke] [--remote]
  */
-
-/** The one shared database every D1-backed worker binds. */
-const DB_NAME = 'recflare'
-
-interface D1ExecResult {
-	results: Array<Record<string, unknown>>
-	success: boolean
-	meta: { changes?: number; rows_read?: number }
-}
-
-/** Escape a value for embedding inside a single-quoted SQL string literal. */
-const sqlStr = (s: string): string => s.replace(/'/g, "''")
 
 /**
  * Resolve the account selector into a SQL WHERE fragment. Exactly one of
@@ -47,59 +36,6 @@ function whereClause(account?: string, username?: string): { where: string; labe
 	return {
 		where: `username_lower = '${sqlStr(username!.toLowerCase())}'`,
 		label: `username "${username}"`,
-	}
-}
-
-/** The deployed D1's real id, from the environment or the gitignored root .env. */
-async function getRemoteD1Id(): Promise<string> {
-	if (process.env.RECFLARE_D1) return process.env.RECFLARE_D1
-	const envPath = path.join(getRepoRoot(), '.env')
-	if (await fs.pathExists(envPath)) {
-		const content = await fs.readFile(envPath, 'utf8')
-		const m = content.match(/^\s*RECFLARE_D1\s*=\s*(.+?)\s*$/m)
-		if (m) return m[1].replace(/^["']|["']$/g, '')
-	}
-	throw new Error('RECFLARE_D1 is not set — add the recflare D1 id to .env (see .env.example)')
-}
-
-/**
- * Run a SQL statement against the shared database via wrangler. Runs from the auth
- * worker's directory (it owns the accounts schema and binds the DB). For `--remote`
- * the committed wrangler.jsonc's "local" database_id placeholder is spliced with the
- * real id into a gitignored generated config — exactly like run-wrangler-migrate.
- */
-async function execSql(sql: string, remote: boolean): Promise<D1ExecResult> {
-	const authDir = path.join(getRepoRoot(), 'apps', 'auth')
-	cd(authDir)
-
-	const args = ['d1', 'execute', DB_NAME, '--command', sql, '--json']
-	let cleanup: (() => Promise<void>) | undefined
-
-	if (remote) {
-		const id = await getRemoteD1Id()
-		const src = await fs.readFile(path.join(authDir, 'wrangler.jsonc'), 'utf8')
-		const generated = src.replace(/("database_id"\s*:\s*")[^"]*(")/, `$1${id}$2`)
-		const genPath = path.join(authDir, 'wrangler.generated.jsonc')
-		await fs.writeFile(genPath, generated)
-		cleanup = () => fs.remove(genPath)
-		args.push('--config', 'wrangler.generated.jsonc', '--remote')
-	} else {
-		args.push('--local')
-	}
-
-	try {
-		// Via `pnpm exec` so wrangler resolves from the auth worker's node_modules
-		// (it isn't a dependency of @repo/tools, so it's not on this process's PATH).
-		const out = await $`pnpm exec wrangler ${args}`.quiet()
-		// wrangler --json prints a one-element array of results to stdout.
-		const start = out.stdout.indexOf('[')
-		if (start === -1) throw new Error(`unexpected d1 execute output:\n${out.stdout}`)
-		const parsed = JSON.parse(out.stdout.slice(start)) as D1ExecResult[]
-		const first = parsed[0]
-		if (!first) throw new Error(`empty d1 execute result:\n${out.stdout}`)
-		return first
-	} finally {
-		if (cleanup) await cleanup()
 	}
 }
 
@@ -131,7 +67,9 @@ async function resolvePassword(flag?: string): Promise<string> {
 	if (!process.stdin.isTTY) {
 		const chunks: Buffer[] = []
 		for await (const chunk of process.stdin) chunks.push(chunk as Buffer)
-		const piped = Buffer.concat(chunks).toString('utf8').replace(/\r?\n$/, '')
+		const piped = Buffer.concat(chunks)
+			.toString('utf8')
+			.replace(/\r?\n$/, '')
 		if (piped === '') throw new Error('no password provided on stdin')
 		return piped
 	}
@@ -140,16 +78,6 @@ async function resolvePassword(flag?: string): Promise<string> {
 	const second = await promptHidden('Confirm password: ')
 	if (first !== second) throw new Error('passwords did not match')
 	return first
-}
-
-/** A short, loud label for which database a command is about to touch. */
-const target = (remote: boolean): string =>
-	remote ? chalk.red(`${DB_NAME} (remote)`) : chalk.cyan(`${DB_NAME} (local)`)
-
-/** Resolve the --local/--remote target flags. Local is the default. */
-function resolveRemote(opts: { local?: boolean; remote?: boolean }): boolean {
-	if (opts.local && opts.remote) throw new Error('pass at most one of --local / --remote')
-	return opts.remote === true
 }
 
 /**
@@ -251,7 +179,11 @@ const lookup = new Command('lookup')
 			return
 		}
 		const asText = (v: unknown): string =>
-			v == null ? '' : typeof v === 'object' ? JSON.stringify(v) : String(v as number | string | boolean)
+			v == null
+				? ''
+				: typeof v === 'object'
+					? JSON.stringify(v)
+					: String(v as number | string | boolean)
 		const boolKeys = new Set(['hasPassword', 'isDeveloper', 'isModerator'])
 		const table = new Table()
 		for (const [key, value] of Object.entries(row)) {
